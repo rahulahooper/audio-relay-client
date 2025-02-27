@@ -46,11 +46,19 @@
 #define AUDIO_NET_WIFI_PASS      "AudioRelayNetworkPassword" 
 #define EXAMPLE_ESP_MAXIMUM_RETRY  10
 
-// #define ESP_WIFI_SAE_MODE WPA3_SAE_PWE_HUNT_AND_PECK
-// #define EXAMPLE_H2E_IDENTIFIER ""
-// #define ESP_WIFI_SCAN_AUTH_MODE_THRESHOLD WIFI_AUTH_WPA3_PSK
+#define ESP_WIFI_SAE_MODE WPA3_SAE_PWE_HUNT_AND_PECK
+#define EXAMPLE_H2E_IDENTIFIER ""
+#define ESP_WIFI_SCAN_AUTH_MODE_THRESHOLD WIFI_AUTH_WPA3_PSK
 
 static const char *payload = "Hello from PC";
+
+#define PAYLOAD_LEN 996
+struct AudioPacket_t
+{
+    uint16_t seqnum;
+    uint8_t  payload[PAYLOAD_LEN];
+    uint16_t checksum;
+};
 
 /* FreeRTOS event group to signal when we are connected*/
 static EventGroupHandle_t s_wifi_event_group;
@@ -65,27 +73,62 @@ static const char *TAG = "wifi station";
 
 static int s_retry_num = 0;
 
-void wifi_init_sta(const char* ssid, const char* password);
+esp_err_t wifi_station_start_and_connect(wifi_config_t* wifi_config, bool* error);
 
-esp_err_t init_sntp()
+
+////////////////////////////////////////////////////////////////////
+// crc16()
+//
+////////////////////////////////////////////////////////////////////
+uint16_t crc16(uint8_t* data, uint32_t len)
+{
+    // Compute a crc16 using polynomial 0x1021 and seed value 0xFFFF
+    const uint16_t seed       = 0xFFFF;
+    const uint16_t polynomial = 0x1021;
+
+    uint16_t crc = seed;
+
+    for (int i = 0; i < len; i++)
+    {
+        uint8_t byte = data[i];
+
+        for (int j = 0; j < 8; j++)
+        {
+            if ((byte & 0x80) != 0)
+            {
+                crc ^= (polynomial << 8);
+            }
+
+            crc = (crc << 1) & 0xFFFF;
+            byte <<= 1;
+        }
+    }
+
+    return crc;
+}
+
+
+////////////////////////////////////////////////////////////////////
+// set_system_time()
+//
+// Connects to a Network Time Protocol (NTP) server for setting the
+// ESP32 clock. The function disconnects from the server at exit.
+// The ESP32 must be connected to the Internet before entering this
+// function (see wifi_station_start_and_connect()).
+////////////////////////////////////////////////////////////////////
+esp_err_t set_system_time()
 {
     ESP_LOGI(TAG, "%s Initializing sntp network interface\n", __func__);
 
-    // Connect to home wifi network 
-    // (SSID and Password configured through the esp-idf menuconfig)
-    ESP_LOGI(TAG, "%s Connecting to home WIFI network\n", __func__);
-    wifi_init_sta("NETGEAR56", "livelyoctopus070");
-    ESP_LOGI(TAG, "%s Connected to home WIFI network\n", __func__);
-
-    // ESP_ERROR_CHECK(example_connect());
-
+    // TODO: Verify that we are connected to a Wifi network before connecting
+    //       to the NTP server
     esp_sntp_config_t config = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
     config.start = false;   // wait for Wifi connection before starting SNTP service
     config.server_from_dhcp = true;     // use DHCP server to get SNTP IP address
-    esp_netif_sntp_init(&config);
+    ESP_ERROR_CHECK(esp_netif_sntp_init(&config));
 
     ESP_LOGI(TAG, "%s Starting SNTP client\n", __func__);
-    esp_netif_sntp_start();
+    ESP_ERROR_CHECK(esp_netif_sntp_start());
 
     time_t now = 0;
     struct tm timeinfo = { 0 };
@@ -99,7 +142,6 @@ esp_err_t init_sntp()
     localtime_r(&now, &timeinfo);
     ESP_LOGI(TAG, "%s: Connected to SNTP server!\n", __func__);
 
-    // ESP_ERROR_CHECK( example_disconnect() );
     esp_netif_sntp_deinit();
 
     char strftime_buf[64];
@@ -114,6 +156,25 @@ esp_err_t init_sntp()
     return ESP_OK;
 }   
 
+////////////////////////////////////////////////////////////////////
+// get_system_time()
+//
+// Return time since epoch in microseconds. If system time is not
+// set properly (see set_system_time), results won't reflect the 
+// actual time.
+////////////////////////////////////////////////////////////////////
+void get_system_time(int64_t* time_us)
+{
+    struct timeval tv_now;
+    gettimeofday(&tv_now, NULL);
+    *time_us = (int64_t)tv_now.tv_sec * 1000000L + (int64_t)tv_now.tv_usec;
+}
+
+////////////////////////////////////////////////////////////////////
+// udp_client_task
+//
+// Main event loop for streaming data to server.
+////////////////////////////////////////////////////////////////////
 static void udp_client_task(void *pvParameters)
 {
     char rx_buffer[128];
@@ -123,6 +184,13 @@ static void udp_client_task(void *pvParameters)
     // I guess we're using the default one?
     esp_netif_t* esp_netif = esp_netif_get_default_netif();
     esp_netif_ip_info_t* ip_info = malloc(sizeof(esp_netif_ip_info_t));
+    if (!esp_netif || !ip_info)
+    {
+        ESP_LOGE(TAG, "%s Got a nullptr: esp_netif=%p, ip_info=%p\n", __func__, esp_netif, ip_info);
+        vTaskDelete(NULL);
+        return;
+    }
+
     ESP_ERROR_CHECK( esp_netif_get_ip_info(esp_netif, ip_info) );
     struct in_addr ipv4_addr;
     char ipv4_str[INET_ADDRSTRLEN];
@@ -169,9 +237,16 @@ static void udp_client_task(void *pvParameters)
 
         ESP_LOGI(TAG, "Socket created, sending to %s:%d", HOST_IP_ADDR, PORT);
 
+        uint16_t seqnum = 0;
+        int64_t timesent, timerecv;
         while (1) {
 
-            int err = sendto(sock, payload, strlen(payload), 0, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
+            struct AudioPacket_t packet;
+            packet.seqnum = seqnum++;
+            packet.checksum = crc16(packet.payload, PAYLOAD_LEN);
+
+            get_system_time(&timesent);
+            int err = sendto(sock, &packet, sizeof(packet), 0, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
             if (err < 0) {
                 ESP_LOGE(TAG, "Error occurred during sending: errno %d", errno);
                 break;
@@ -182,23 +257,22 @@ static void udp_client_task(void *pvParameters)
             socklen_t socklen = sizeof(source_addr);
             int len = recvfrom(sock, rx_buffer, sizeof(rx_buffer) - 1, 0, (struct sockaddr *)&source_addr, &socklen);
 
-            // Error occurred during receiving
-            if (len < 0) {
+            
+            if (len < 0) {          // Error occurred during receiving
                 ESP_LOGE(TAG, "recvfrom failed: errno %d", errno);
                 break;
             }
-            // Data received
-            else {
+            else {                  // Data received
+                get_system_time(&timerecv);
                 rx_buffer[len] = 0; // Null-terminate whatever we received and treat like a string
-                ESP_LOGI(TAG, "Received %d bytes from %s:", len, ipv4_str);
+                ESP_LOGI(TAG, "%s Received %d bytes from %s:", __func__, len, ipv4_str);
 
                 struct sockaddr_in * source_addr_in = (struct sockaddr_in *)&source_addr;
-                ESP_LOGI(TAG, "Source address: %s\n", inet_ntoa(source_addr_in->sin_addr));
-                ESP_LOGI(TAG, "%s", rx_buffer);
-                if (strncmp(rx_buffer, "OK: ", 4) == 0) {
-                    ESP_LOGI(TAG, "Received expected message, reconnecting");
-                    break;
-                }
+                ESP_LOGI(TAG, "%s Source address: %s\n", __func__, inet_ntoa(source_addr_in->sin_addr));
+                ESP_LOGI(TAG, "%s Message content: %s", __func__, rx_buffer);
+
+
+                ESP_LOGI(TAG, "%s Round trip time: %lld\n", __func__, timerecv - timesent);
             }
 
             vTaskDelay(2000 / portTICK_PERIOD_MS);
@@ -235,18 +309,49 @@ static void event_handler(void* arg, esp_event_base_t event_base,
     }
 }
 
-void wifi_init_sta(const char ssid[], const char password[])
+
+////////////////////////////////////////////////////////////////////
+// wifi_setup_driver()
+//
+// Allocates resources for WiFi driver such as WiFi control
+// structures, RX/TX buffers, NVS, etc. This function should
+// only be called once. Call wifi_deinit_driver() on shutdown.
+////////////////////////////////////////////////////////////////////
+esp_err_t wifi_setup_driver(wifi_init_config_t* cfg)
 {
-    ESP_LOGI(TAG, "%s: Connecting to WiFi network with ssid %s, passwrod %s\n", 
-        __func__, ssid, password);
-        
+    ESP_LOGI(TAG, "%s: Setting up WiFi driver\n", __func__);        
     s_wifi_event_group = xEventGroupCreate();
 
     esp_netif_create_default_wifi_sta();
 
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    wifi_init_config_t default_cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&default_cfg));
 
+    memcpy(cfg, &default_cfg, sizeof(default_cfg));
+
+    return ESP_OK;
+}
+
+
+////////////////////////////////////////////////////////////////////
+// wifi_deinit_driver()
+//
+// Call on shutdown. WiFi operations will not be supported
+// after calling this function.
+////////////////////////////////////////////////////////////////////
+esp_err_t wifi_deinit_driver()
+{
+    ESP_LOGE(TAG, "%s Not implemented yet\n", __func__);
+    return ESP_ERR_NOT_SUPPORTED;
+}
+
+////////////////////////////////////////////////////////////////////
+// wifi_station_start_and_connect()
+//
+////////////////////////////////////////////////////////////////////
+esp_err_t wifi_station_start_and_connect(wifi_config_t* wifi_config, bool* error)
+{
+    *error = true;
     esp_event_handler_instance_t instance_any_id;
     esp_event_handler_instance_t instance_got_ip;
     ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
@@ -260,51 +365,74 @@ void wifi_init_sta(const char ssid[], const char password[])
                                                         NULL,
                                                         &instance_got_ip));
 
-    wifi_config_t wifi_config = {
-        .sta = {
-            .ssid = "NETGEAR56",
-            .password = "livelyoctopus070",
-            /* Authmode threshold resets to WPA2 as default if password matches WPA2 standards (password len => 8).
-             * If you want to connect the device to deprecated WEP/WPA networks, Please set the threshold value
-             * to WIFI_AUTH_WEP/WIFI_AUTH_WPA_PSK and set the password with length and format matching to
-             * WIFI_AUTH_WEP/WIFI_AUTH_WPA_PSK standards.
-             */
-            // .threshold.authmode = ESP_WIFI_SCAN_AUTH_MODE_THRESHOLD,
-            // .sae_pwe_h2e = ESP_WIFI_SAE_MODE,
-            // .sae_h2e_identifier = EXAMPLE_H2E_IDENTIFIER,
-        },
-    };
-
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA) );
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config) );
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, wifi_config) );
     ESP_ERROR_CHECK(esp_wifi_start() );
 
-    ESP_LOGI(TAG, "wifi_init_sta finished.");
+    ESP_LOGI(TAG, "wifi_station_start_and_connect() finished.");
 
     /* Waiting until either the connection is established (WIFI_CONNECTED_BIT) or connection failed for the maximum
      * number of re-tries (WIFI_FAIL_BIT). The bits are set by event_handler() (see above) */
+    xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
     EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
             WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
             pdFALSE,
             pdFALSE,
             portMAX_DELAY);
-
+    
     /* xEventGroupWaitBits() returns the bits before the call returned, hence we can test which event actually
      * happened. */
+    const char* ssid = (const char*)(wifi_config->sta.ssid);
+    const char* password = (const char*)(wifi_config->sta.password);
     if (bits & WIFI_CONNECTED_BIT) 
     {
-        ESP_LOGI(TAG, "connected to ap SSID:%s password:%s",
-                ssid, password);
+        ESP_LOGI(TAG, "%s: connected to ap SSID:%s password:%s",
+                __func__, ssid, password);
+        *error = false;
     } 
     else if (bits & WIFI_FAIL_BIT) 
     {
-        ESP_LOGI(TAG, "Failed to connect to SSID:%s, password:%s",
-                ssid, password);
+        ESP_LOGI(TAG, "%s: Failed to connect to SSID:%s, password:%s",
+                __func__, ssid, password);
     } 
     else 
     {
-        ESP_LOGE(TAG, "UNEXPECTED EVENT");
+        ESP_LOGE(TAG, "%s: UNEXPECTED EVENT: %lx\n",
+                __func__, bits);
     }
+
+    return ESP_OK;
+}
+
+
+////////////////////////////////////////////////////////////////////
+// wifi_station_disconnect_and_stop()
+//
+////////////////////////////////////////////////////////////////////
+esp_err_t wifi_station_disconnect_and_stop()
+{
+    esp_err_t ret = esp_wifi_disconnect();
+    if (ret == ESP_ERR_WIFI_NOT_INIT)
+    {
+        ESP_LOGE(TAG, "%s ESP32 Wifi was not initialized by wifi_station_start_and_connect()\n", __func__);
+    }
+    else if (ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "%s Unexpected errno: %s\n", __func__, esp_err_to_name(ret));
+    }
+
+    ret = esp_wifi_stop();
+
+    if (ret == ESP_ERR_WIFI_NOT_INIT)
+    {
+        ESP_LOGE(TAG, "%s ESP32 Wifi was not initialized by wifi_station_start_and_connect()\n", __func__);
+    }
+    else if (ret != ESP_OK)
+    {
+        ESP_LOGE(TAG, "%s Unexpected errno: %s\n", __func__, esp_err_to_name(ret));
+    }
+
+    return ret;
 }
 
 void app_main(void)
@@ -320,7 +448,6 @@ void app_main(void)
     ESP_LOGI(TAG, "%s LWIP config'd\n", __func__);
     #endif
 
-    //Initialize NVS
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
       ESP_ERROR_CHECK(nvs_flash_erase());
@@ -328,10 +455,62 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(ret);
 
-    // Initialize system time
-    ESP_ERROR_CHECK(init_sntp());
+    ESP_LOGI(TAG, "%s Setting up WiFi driver", __func__);
+    wifi_init_config_t cfg;
+    ESP_ERROR_CHECK(wifi_setup_driver(&cfg));
 
-    ESP_LOGI(TAG, "ESP_WIFI_MODE_STA");
-    wifi_init_sta(AUDIO_NET_WIFI_SSID, AUDIO_NET_WIFI_PASS);
+    ESP_LOGI(TAG, "%s Connecting to home WIFI network\n", __func__);
+    bool error = true;
+
+
+    wifi_config_t home_wifi_config = {
+        .sta = {
+            .ssid = "NETGEAR56",
+            .password = "livelyoctopus070",
+            /* Authmode threshold resets to WPA2 as default if password matches WPA2 standards (password len => 8).
+             * If you want to connect the device to deprecated WEP/WPA networks, Please set the threshold value
+             * to WIFI_AUTH_WEP/WIFI_AUTH_WPA_PSK and set the password with length and format matching to
+             * WIFI_AUTH_WEP/WIFI_AUTH_WPA_PSK standards.
+             */
+            // .threshold.authmode = ESP_WIFI_SCAN_AUTH_MODE_THRESHOLD,
+            // .sae_pwe_h2e = ESP_WIFI_SAE_MODE,
+            // .sae_h2e_identifier = EXAMPLE_H2E_IDENTIFIER,
+        },
+    };
+
+    ESP_ERROR_CHECK(wifi_station_start_and_connect(&home_wifi_config, &error));
+    if (error)
+    {
+        ESP_LOGE(TAG, "%s: Failed to connect to home WIFI network\n", __func__);
+        return;
+    }
+    else
+    {
+        ESP_LOGI(TAG, "%s Connected to home WIFI network\n", __func__);
+    }
+
+    ESP_ERROR_CHECK(set_system_time());
+
+    ESP_LOGI(TAG, "%s: Disconnecting from home WiFi network\n", __func__);
+    ESP_ERROR_CHECK(wifi_station_disconnect_and_stop());
+
+    ESP_LOGI(TAG, "%s: Connecting to Audio Relay Wifi Network\n", __func__);
+
+    wifi_config_t audio_wifi_config = {
+        .sta = {
+            .ssid = AUDIO_NET_WIFI_SSID,
+            .password = AUDIO_NET_WIFI_PASS,
+            /* Authmode threshold resets to WPA2 as default if password matches WPA2 standards (password len => 8).
+             * If you want to connect the device to deprecated WEP/WPA networks, Please set the threshold value
+             * to WIFI_AUTH_WEP/WIFI_AUTH_WPA_PSK and set the password with length and format matching to
+             * WIFI_AUTH_WEP/WIFI_AUTH_WPA_PSK standards.
+             */
+            .threshold.authmode = ESP_WIFI_SCAN_AUTH_MODE_THRESHOLD,
+            .sae_pwe_h2e = ESP_WIFI_SAE_MODE,
+            .sae_h2e_identifier = EXAMPLE_H2E_IDENTIFIER,
+        },
+    };
+
+    wifi_station_start_and_connect(&audio_wifi_config, &error);
     xTaskCreate(udp_client_task, "udp_client", 4096, NULL, 5, NULL);
 }
