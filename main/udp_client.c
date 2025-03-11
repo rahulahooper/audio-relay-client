@@ -64,12 +64,22 @@ typedef struct AudioPacket_t
     uint8_t  payload[PAYLOAD_MAX_LEN];
 } AudioPacket_t;
 
-
 typedef struct ResponsePacket_t
 {
     uint16_t seqnum;
     char     response[5];   // large enough to hold the "NACK" string
 } ResponsePacket_t;
+
+typedef enum TransmitTaskState_t
+{
+    HOME_NETWORK_CONNECT,
+    SET_SYSTEM_TIME,
+    NETWORK_DISCONNECT,
+    RELAY_NETWORK_CONNECT,
+    STREAM_TO_SERVER,
+} TransmitTaskState_t;
+
+static TransmitTaskState_t transmitTaskState;
 
 /* FreeRTOS event group to signal when we are connected*/
 static EventGroupHandle_t s_wifi_event_group;
@@ -81,20 +91,27 @@ static EventGroupHandle_t s_wifi_event_group;
 #define WIFI_FAIL_BIT      BIT1
 
 static const char *TAG = "wifi station";
+static int gWifiConnectAttempts = 0;
 
-static int s_retry_num = 0;
+static AudioPacket_t gAudioPackets[2];
+static AudioPacket_t * activePacket;   // transmitting task transmits this packet
+static AudioPacket_t * backgroundPacket; // sampling task fills this packet
 
-esp_err_t wifi_station_start_and_connect(wifi_config_t* wifi_config, bool* error);
+static const UBaseType_t transmissionDoneNotifyIndex = 0;      // set by the transmission thread when it is done transmitting data
+static const UBaseType_t dataReadyNotifyIndex;                 // set by the sampling thread when there is new data to transmit
 
+static TaskHandle_t samplingTaskHandle = NULL;
+static TaskHandle_t transmitTaskHandle = NULL;
 
 
 ////////////////////////////////////////////////////////////////////
 // crc16()
 //
+// Compute a crc16 using polynomial 0x1021 and seed value 0xFFFF
+// (see https://en.wikipedia.org/wiki/Cyclic_redundancy_check)
 ////////////////////////////////////////////////////////////////////
 uint16_t crc16(uint8_t* data, uint32_t len)
 {
-    // Compute a crc16 using polynomial 0x1021 and seed value 0xFFFF
     const uint16_t seed       = 0xFFFF;
     const uint16_t polynomial = 0x1021;
 
@@ -170,6 +187,7 @@ esp_err_t set_system_time()
     return ESP_OK;
 }   
 
+
 ////////////////////////////////////////////////////////////////////
 // get_system_time()
 //
@@ -185,24 +203,30 @@ void get_system_time(int64_t* time_us)
 }
 
 
-static void event_handler(void* arg, esp_event_base_t event_base,
+////////////////////////////////////////////////////////////////////
+// wifi_event_handler()
+//
+// Callback function for handling wifi connect / disconnect events
+////////////////////////////////////////////////////////////////////
+static void wifi_event_handler(void* arg, esp_event_base_t event_base,
                                 int32_t event_id, void* event_data)
 {
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        if (s_retry_num < EXAMPLE_ESP_MAXIMUM_RETRY) {
+        if (gWifiConnectAttempts < EXAMPLE_ESP_MAXIMUM_RETRY) {
             esp_wifi_connect();
-            s_retry_num++;
-            ESP_LOGI(TAG, "retry to connect to the AP");
+            gWifiConnectAttempts++;
+            ESP_LOGI(TAG, "%s Failed to connect to the AP, retrying (attempt #%u)\n", __func__, gWifiConnectAttempts);
         } else {
             xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
+            gWifiConnectAttempts = 0;
         }
         ESP_LOGI(TAG,"connect to the AP fail");
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
         ESP_LOGI(TAG, "got ip:" IPSTR, IP2STR(&event->ip_info.ip));
-        s_retry_num = 0;
+        gWifiConnectAttempts = 0;
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
     }
 }
@@ -213,7 +237,8 @@ static void event_handler(void* arg, esp_event_base_t event_base,
 //
 // Allocates resources for WiFi driver such as WiFi control
 // structures, RX/TX buffers, NVS, etc. This function should
-// only be called once. Call wifi_deinit_driver() on shutdown.
+// only be called once at system startup. Call 
+// wifi_deinit_driver() on shutdown.
 ////////////////////////////////////////////////////////////////////
 esp_err_t wifi_setup_driver(wifi_init_config_t* cfg)
 {
@@ -239,27 +264,27 @@ esp_err_t wifi_setup_driver(wifi_init_config_t* cfg)
 ////////////////////////////////////////////////////////////////////
 esp_err_t wifi_deinit_driver()
 {
-    ESP_LOGE(TAG, "%s Not implemented yet\n", __func__);
-    return ESP_ERR_NOT_SUPPORTED;
+    ESP_ERROR_CHECK(esp_wifi_deinit());
+    return ESP_OK;
 }
 
 ////////////////////////////////////////////////////////////////////
 // wifi_station_start_and_connect()
 //
 ////////////////////////////////////////////////////////////////////
-esp_err_t wifi_station_start_and_connect(wifi_config_t* wifi_config, bool* error)
+void wifi_station_start_and_connect(wifi_config_t* wifi_config, bool* error)
 {
     *error = true;
     esp_event_handler_instance_t instance_any_id;
     esp_event_handler_instance_t instance_got_ip;
     ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
                                                         ESP_EVENT_ANY_ID,
-                                                        &event_handler,
+                                                        &wifi_event_handler,
                                                         NULL,
                                                         &instance_any_id));
     ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT,
                                                         IP_EVENT_STA_GOT_IP,
-                                                        &event_handler,
+                                                        &wifi_event_handler,
                                                         NULL,
                                                         &instance_got_ip));
 
@@ -267,10 +292,11 @@ esp_err_t wifi_station_start_and_connect(wifi_config_t* wifi_config, bool* error
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, wifi_config) );
     ESP_ERROR_CHECK(esp_wifi_start() );
 
-    ESP_LOGI(TAG, "wifi_station_start_and_connect() finished.");
+    ESP_LOGI(TAG, "%s Started WiFi!\n", __func__);
 
-    /* Waiting until either the connection is established (WIFI_CONNECTED_BIT) or connection failed for the maximum
-     * number of re-tries (WIFI_FAIL_BIT). The bits are set by event_handler() (see above) */
+    // Wait until either the connection is established (WIFI_CONNECTED_BIT) or 
+    // connection failed after the maximum number of re-tries (WIFI_FAIL_BIT). 
+    // The bits are set by wifi_event_handler() (see above)
     xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
     EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
             WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
@@ -278,8 +304,6 @@ esp_err_t wifi_station_start_and_connect(wifi_config_t* wifi_config, bool* error
             pdFALSE,
             portMAX_DELAY);
     
-    /* xEventGroupWaitBits() returns the bits before the call returned, hence we can test which event actually
-     * happened. */
     const char* ssid = (const char*)(wifi_config->sta.ssid);
     const char* password = (const char*)(wifi_config->sta.password);
     if (bits & WIFI_CONNECTED_BIT) 
@@ -298,50 +322,54 @@ esp_err_t wifi_station_start_and_connect(wifi_config_t* wifi_config, bool* error
         ESP_LOGE(TAG, "%s: UNEXPECTED EVENT: %lx\n",
                 __func__, bits);
     }
-
-    return ESP_OK;
 }
 
 
 ////////////////////////////////////////////////////////////////////
 // wifi_station_disconnect_and_stop()
 //
+// This function will disconnect from whatever network we are
+// currently on.
 ////////////////////////////////////////////////////////////////////
-esp_err_t wifi_station_disconnect_and_stop()
+void wifi_station_disconnect_and_stop(bool* error)
 {
+    ESP_LOGI(TAG, "%s: Disconnecting from home WiFi network\n", __func__);
+    *error = true;
+
     esp_err_t ret = esp_wifi_disconnect();
-    if (ret == ESP_ERR_WIFI_NOT_INIT)
+    if (ret == ESP_ERR_WIFI_NOT_STARTED)
     {
-        ESP_LOGE(TAG, "%s ESP32 Wifi was not initialized by wifi_station_start_and_connect()\n", __func__);
+        ESP_LOGI(TAG, "%s ESP32 Wifi station wasn't started wifi_station_start_and_connect()\n", __func__);
+        *error = false;
+        return;
+    }
+    else if (ret == ESP_ERR_WIFI_NOT_INIT)
+    {
+        ESP_LOGI(TAG, "%s ESP32 Wifi resources were not initialized\n", __func__);
+        *error = false;
+        return;
     }
     else if (ret != ESP_OK)
     {
         ESP_LOGE(TAG, "%s Unexpected errno: %s\n", __func__, esp_err_to_name(ret));
+        return;
     }
 
     ret = esp_wifi_stop();
 
     if (ret == ESP_ERR_WIFI_NOT_INIT)
     {
-        ESP_LOGE(TAG, "%s ESP32 Wifi was not initialized by wifi_station_start_and_connect()\n", __func__);
+        ESP_LOGE(TAG, "%s ESP32 Wifi resouces were not initialized\n", __func__);
+        return;
     }
     else if (ret != ESP_OK)
     {
         ESP_LOGE(TAG, "%s Unexpected errno: %s\n", __func__, esp_err_to_name(ret));
+        return;
     }
 
-    return ret;
+    *error = false;
 }
-
-static AudioPacket_t gAudioPackets[2];
-static AudioPacket_t * activePacket;   // transmitting task transmits this packet
-static AudioPacket_t * backgroundPacket; // sampling task fills this packet
-
-static const UBaseType_t transmissionDoneNotifyIndex = 0;      // set by the transmission thread when it is done transmitting data
-static const UBaseType_t dataReadyNotifyIndex;                 // set by the sampling thread when there is new data to transmit
-
-static TaskHandle_t samplingTaskHandle = NULL;
-static TaskHandle_t transmitTaskHandle = NULL;
 
 
 ////////////////////////////////////////////////////////////////////
@@ -355,7 +383,7 @@ void sampling_task()
     backgroundPacket = &gAudioPackets[1];
 
     const uint32_t SAMPLE_RATE = 44100; // hz
-    const uint32_t SAMPLE_PERIOD_MS = (uint32_t)(1.0f / SAMPLE_RATE / 1000);
+    const uint32_t SAMPLE_PERIOD_MS = 10; //(uint32_t)(1.0f / SAMPLE_RATE / 1000);
 
     while (transmitTaskHandle == NULL)
     {
@@ -368,6 +396,7 @@ void sampling_task()
     while (true)
     {
 
+        vTaskDelay(10 / portTICK_PERIOD_MS);
         backgroundPacket->seqnum = ++seqnum;
         backgroundPacket->checksum = 0;
         backgroundPacket->payloadSize = 0;
@@ -388,6 +417,7 @@ void sampling_task()
         }
 
         ESP_LOGI(TAG, "%s Transmission Done!\n", __func__);
+        
         // At this point, the transmit thread is waiting for a data ready signal and is
         // therefore not sending any data. It is safe to swap the active and background
         // packets.
@@ -395,29 +425,90 @@ void sampling_task()
         activePacket = backgroundPacket;
         backgroundPacket = tmp;
 
-        ESP_LOGI(TAG, "%s Swapped buffers, notifying transmission task...\n", __func__);
+        ESP_LOGI(TAG, "%s Notifying transmission task that new data is available\n", __func__);
         xTaskNotifyGiveIndexed(transmitTaskHandle, dataReadyNotifyIndex);
 
-        // Q: How do we ensure that the sampling thread doesn't run through this loop multiple times before
-        //      the xmitter thread gets time to run?
     }
 
+    ESP_LOGE(TAG, "%s Terminating sampling task", __func__);
     vTaskDelete(NULL);
+}
+
+////////////////////////////////////////////////////////////////////
+// home_wifi_connect()
+//
+////////////////////////////////////////////////////////////////////
+void home_wifi_connect(bool* error)
+{
+    ESP_LOGI(TAG, "%s Connecting to home WIFI network\n", __func__);
+    *error = true;
+
+    wifi_config_t home_wifi_config = {
+        .sta = {
+            .ssid = "NETGEAR56",
+            .password = "livelyoctopus070",
+            /* Authmode threshold resets to WPA2 as default if password matches WPA2 standards (password len => 8).
+             * If you want to connect the device to deprecated WEP/WPA networks, Please set the threshold value
+             * to WIFI_AUTH_WEP/WIFI_AUTH_WPA_PSK and set the password with length and format matching to
+             * WIFI_AUTH_WEP/WIFI_AUTH_WPA_PSK standards.
+             */
+            // .threshold.authmode = ESP_WIFI_SCAN_AUTH_MODE_THRESHOLD,
+            // .sae_pwe_h2e = ESP_WIFI_SAE_MODE,
+            // .sae_h2e_identifier = EXAMPLE_H2E_IDENTIFIER,
+        },
+    };
+
+    wifi_station_start_and_connect(&home_wifi_config, error);
+    if (*error)
+    {
+        ESP_LOGE(TAG, "%s: Failed to connect to home WIFI network\n", __func__);
+        return;
+    }
+    else
+    {
+        ESP_LOGI(TAG, "%s Connected to home WIFI network\n", __func__);
+    }
+
 }
 
 
 ////////////////////////////////////////////////////////////////////
-// transmit_task 
+// relay_network_connect 
 //
-// Main event loop for streaming data to server.
+// Connect to the Audio Relay Network server
 ////////////////////////////////////////////////////////////////////
-static void transmit_task(void *pvParameters)
+void relay_network_connect(bool * error)
 {
-    struct ResponsePacket_t response;
-    int addr_family = 0;
-    int ip_protocol = 0;
+    ESP_LOGI(TAG, "%s: Connecting to Audio Relay Wifi Network\n", __func__);
 
-    // I guess we're using the default one?
+    wifi_config_t audio_wifi_config = {
+        .sta = {
+            .ssid = AUDIO_NET_WIFI_SSID,
+            .password = AUDIO_NET_WIFI_PASS,
+            /* Authmode threshold resets to WPA2 as default if password matches WPA2 standards (password len => 8).
+             * If you want to connect the device to deprecated WEP/WPA networks, Please set the threshold value
+             * to WIFI_AUTH_WEP/WIFI_AUTH_WPA_PSK and set the password with length and format matching to
+             * WIFI_AUTH_WEP/WIFI_AUTH_WPA_PSK standards.
+             */
+            .threshold.authmode = ESP_WIFI_SCAN_AUTH_MODE_THRESHOLD,
+            .sae_pwe_h2e = ESP_WIFI_SAE_MODE,
+            .sae_h2e_identifier = EXAMPLE_H2E_IDENTIFIER,
+        },
+    };
+
+    wifi_station_start_and_connect(&audio_wifi_config, error);
+}
+
+
+////////////////////////////////////////////////////////////////////
+// stream_audio_to_server 
+//
+////////////////////////////////////////////////////////////////////
+void stream_audio_to_server(bool* error)
+{
+    *error = true;
+
+    // Get IP address of the relay network server
     esp_netif_t* esp_netif = esp_netif_get_default_netif();
     esp_netif_ip_info_t* ip_info = malloc(sizeof(esp_netif_ip_info_t));
     if (!esp_netif || !ip_info)
@@ -437,115 +528,168 @@ static void transmit_task(void *pvParameters)
         ESP_LOGI(TAG, "Gateway IPv4: %s", ipv4_str);
     }
 
+    // Set up socket connection with server
+    int addr_family = 0;
+    int ip_protocol = 0;
+
+    struct sockaddr_in dest_addr;
+    dest_addr.sin_addr.s_addr = inet_addr(ipv4_str);
+    dest_addr.sin_family = AF_INET;
+    dest_addr.sin_port = htons(PORT);
+    addr_family = AF_INET;
+    ip_protocol = IPPROTO_IP;
+    
+    int sock = socket(addr_family, SOCK_DGRAM, ip_protocol);
+    if (sock < 0) {
+        ESP_LOGE(TAG, "Unable to create socket: errno %d", errno);
+        return;
+    }
+
+    // Set timeout
+    struct timeval timeout;
+    timeout.tv_sec = 10;
+    timeout.tv_usec = 0;
+    setsockopt (sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof timeout);
+
+    ESP_LOGI(TAG, "Socket created, sending to %s:%d", HOST_IP_ADDR, PORT);
+
+    int64_t timesent, timerecv;
+
+    // Wait for sampling task to come up
     while (samplingTaskHandle == NULL)
     {
         ESP_LOGI(TAG, "%s Waiting for sampling task to be created...\n", __func__);
         vTaskDelay(500 / portTICK_PERIOD_MS);
     }
 
+    // Stream audio data to server
     while (1) {
 
-#if defined(CONFIG_EXAMPLE_IPV4)
-        struct sockaddr_in dest_addr;
-        dest_addr.sin_addr.s_addr = inet_addr(ipv4_str);
-        dest_addr.sin_family = AF_INET;
-        dest_addr.sin_port = htons(PORT);
-        addr_family = AF_INET;
-        ip_protocol = IPPROTO_IP;
-#elif defined(CONFIG_EXAMPLE_IPV6)
-        struct sockaddr_in6 dest_addr = { 0 };
-        inet6_aton(HOST_IP_ADDR, &dest_addr.sin6_addr);
-        dest_addr.sin6_family = AF_INET6;
-        dest_addr.sin6_port = htons(PORT);
-        dest_addr.sin6_scope_id = esp_netif_get_netif_impl_index(EXAMPLE_INTERFACE);
-        addr_family = AF_INET6;
-        ip_protocol = IPPROTO_IPV6;
-#elif defined(CONFIG_EXAMPLE_SOCKET_IP_INPUT_STDIN)
-        struct sockaddr_storage dest_addr = { 0 };
-        ESP_ERROR_CHECK(get_addr_from_stdin(PORT, SOCK_DGRAM, &ip_protocol, &addr_family, &dest_addr));
-#endif
+        // Indicate to sampling thread that there is not data to transmit
+        ESP_LOGI(TAG, "%s Notifying of transmission done.\n", __func__);
+        xTaskNotifyGiveIndexed(samplingTaskHandle, transmissionDoneNotifyIndex);
 
-
-        int sock = socket(addr_family, SOCK_DGRAM, ip_protocol);
-        if (sock < 0) {
-            ESP_LOGE(TAG, "Unable to create socket: errno %d", errno);
-            break;
+        // Wait for the sampling task to indicate that there is new data available
+        ESP_LOGI(TAG, "%s Waiting for data ready.\n", __func__);
+        if(ulTaskNotifyTakeIndexed(dataReadyNotifyIndex, pdTRUE, pdMS_TO_TICKS(1000)))
+        {
+            ESP_LOGI(TAG, "%s Got data ready notification.\n", __func__);
+        }
+        else
+        {
+            ESP_LOGE(TAG, "%s Timed out waiting for data ready notification\n", __func__);
+            continue;
         }
 
-        // Set timeout
-        struct timeval timeout;
-        timeout.tv_sec = 10;
-        timeout.tv_usec = 0;
-        setsockopt (sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof timeout);
+        // CRC and transmit the audio packet
+        activePacket->checksum = crc16(activePacket->payload, activePacket->payloadSize);
+        uint32_t packetSize = sizeof(AudioPacket_t) - (PAYLOAD_MAX_LEN - activePacket->payloadSize);
+        get_system_time(&timesent);
 
-        ESP_LOGI(TAG, "Socket created, sending to %s:%d", HOST_IP_ADDR, PORT);
+        ESP_LOGI(TAG, "%s Sending packet with payload len %u and CRC 0x%x to server.\n",
+            __func__, activePacket->payloadSize, activePacket->checksum);
+        int err = sendto(sock, activePacket, packetSize, 0, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
+        if (err < 0) {
+            ESP_LOGE(TAG, "Error occurred during sending: errno %d", errno);
+            return;
+        }
+        ESP_LOGI(TAG, "Message sent");
 
-        int64_t timesent, timerecv;
+        // Receive ACK from server (this can be deleted later)
+        struct ResponsePacket_t response;
+        struct sockaddr_storage source_addr;
+        socklen_t socklen = sizeof(source_addr);
+        int len = recvfrom(sock, &response, sizeof(struct ResponsePacket_t) - 1, 0, (struct sockaddr *)&source_addr, &socklen);
 
-        while (1) {
+        if (len < 0) {
+            ESP_LOGE(TAG, "Failed to receive response from server (errno = %d)", errno);
+            return;
+        }
+        else {
+            get_system_time(&timerecv);
+            response.response[4] = 0; // Null-terminate whatever we received and treat like a string
+            ESP_LOGI(TAG, "%s Received %d bytes from %s:", __func__, len, ipv4_str);
 
-            // Indicate to sampling thread that there is not data to transmit
-            ESP_LOGI(TAG, "%s Notifying of transmission done.\n", __func__);
-            xTaskNotifyGiveIndexed(samplingTaskHandle, transmissionDoneNotifyIndex);
-
-            // Wait for the sampling task to indicate that there is new data available
-            ESP_LOGI(TAG, "%s Waiting for data ready.\n", __func__);
-            if(ulTaskNotifyTakeIndexed(dataReadyNotifyIndex, pdTRUE, pdMS_TO_TICKS(1000)))
-            {
-                ESP_LOGI(TAG, "%s Got data ready notification.\n", __func__);
-            }
-            else
-            {
-                ESP_LOGE(TAG, "%s Timed out waiting for data ready notification\n", __func__);
-                continue;
-            }
-
-            // CRC and transmit the audio packet
-            activePacket->checksum = crc16(activePacket->payload, activePacket->payloadSize);
-            uint32_t packetSize = sizeof(AudioPacket_t) - (PAYLOAD_MAX_LEN - activePacket->payloadSize);
-            get_system_time(&timesent);
-
-            ESP_LOGI(TAG, "%s Sending packet with payload len %u and CRC 0x%x to server.\n",
-                __func__, activePacket->payloadSize, activePacket->checksum);
-            int err = sendto(sock, activePacket, packetSize, 0, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
-            if (err < 0) {
-                ESP_LOGE(TAG, "Error occurred during sending: errno %d", errno);
-                break;
-            }
-            ESP_LOGI(TAG, "Message sent");
-
-            // Receive ACK from server (this can be deleted later)
-            struct sockaddr_storage source_addr; // Large enough for both IPv4 or IPv6
-            socklen_t socklen = sizeof(source_addr);
-            int len = recvfrom(sock, &response, sizeof(struct ResponsePacket_t) - 1, 0, (struct sockaddr *)&source_addr, &socklen);
-
-            
-            if (len < 0) {          // Error occurred during receiving
-                ESP_LOGE(TAG, "recvfrom failed: errno %d", errno);
-                break;
-            }
-            else {                  // Data received
-                get_system_time(&timerecv);
-                response.response[4] = 0; // Null-terminate whatever we received and treat like a string
-                ESP_LOGI(TAG, "%s Received %d bytes from %s:", __func__, len, ipv4_str);
-
-                struct sockaddr_in * source_addr_in = (struct sockaddr_in *)&source_addr;
-                ESP_LOGI(TAG, "%s Source address: %s\n", __func__, inet_ntoa(source_addr_in->sin_addr));
-                ESP_LOGI(TAG, "%s Message content: %s", __func__, response.response);
+            struct sockaddr_in * source_addr_in = (struct sockaddr_in *)&source_addr;
+            ESP_LOGI(TAG, "%s Source address: %s\n", __func__, inet_ntoa(source_addr_in->sin_addr));
+            ESP_LOGI(TAG, "%s Message content: %s", __func__, response.response);
 
 
-                ESP_LOGI(TAG, "%s Round trip time: %lld\n", __func__, timerecv - timesent);
-            }
-
-            vTaskDelay(2000 / portTICK_PERIOD_MS);
+            ESP_LOGI(TAG, "%s Round trip time: %lld\n", __func__, timerecv - timesent);
         }
 
-        if (sock != -1) {
-            ESP_LOGE(TAG, "Shutting down socket and restarting...");
-            shutdown(sock, 0);
-            close(sock);
-        }
+        vTaskDelay(2000 / portTICK_PERIOD_MS);
     }
+
+}
+
+
+////////////////////////////////////////////////////////////////////
+// transmit_task 
+//
+// Main event loop for streaming data to server.
+////////////////////////////////////////////////////////////////////
+static void transmit_task(void *pvParameters)
+{
+
+    while (1) {
+
+        bool error;
+        switch (transmitTaskState)
+        {
+            case HOME_NETWORK_CONNECT:
+            {
+                home_wifi_connect(&error);
+
+                transmitTaskState = error ? NETWORK_DISCONNECT : SET_SYSTEM_TIME;
+                break;
+            }
+            case SET_SYSTEM_TIME:
+            {
+                set_system_time();
+
+                transmitTaskState = NETWORK_DISCONNECT;
+                break;
+            }
+            case NETWORK_DISCONNECT:
+            {
+                wifi_station_disconnect_and_stop(&error);
+
+                transmitTaskState = RELAY_NETWORK_CONNECT;
+                break;
+            }
+            case RELAY_NETWORK_CONNECT:
+            {
+                relay_network_connect(&error);
+
+                if (error)
+                {
+                    ESP_LOGI(TAG, "%s Failed to connect to relay network. Retrying...\n", __func__);
+                    transmitTaskState = NETWORK_DISCONNECT;
+                    vTaskDelay(1000 / portTICK_PERIOD_MS);
+                }
+                else
+                {
+                    transmitTaskState = STREAM_TO_SERVER;
+                }
+            }
+                break;
+            case STREAM_TO_SERVER:
+            {
+                // This function should ideally never return
+                stream_audio_to_server(&error);
+
+                transmitTaskState = NETWORK_DISCONNECT;
+            }
+                break;
+            default:
+                ESP_LOGE(TAG, "%s, Invalid state %u\n", __func__, transmitTaskState);
+                break;
+        }
+
+    }
+    
+    ESP_LOGE(TAG, "%s Terminating transmit task\n", __func__);
     vTaskDelete(NULL);
 }
 
@@ -577,63 +721,32 @@ void app_main(void)
     wifi_init_config_t cfg;
     ESP_ERROR_CHECK(wifi_setup_driver(&cfg));
 
-    ESP_LOGI(TAG, "%s Connecting to home WIFI network\n", __func__);
-    bool error = true;
+    /// Create transmit and sampling tasks
+    // 
+    // The sampling task is responsible for sampling audio
+    // data from the guitar and loading this data into a background
+    // buffer that is invisible to the transmit task.
+    //
+    // The transmit task is responsible for transmitting audio
+    // data to a server (which in this case is another ESP32). The
+    // task reads data out of an "active" buffer. When it is done 
+    // transmitting the active buffer, the transmit task will notify
+    // the sampling task. The sampling task then swaps the background 
+    // and active buffers and notifies the transmit task that new data 
+    // is available. 
+    //
+    ESP_LOGI(TAG, "%s Creating tasks\n", __func__); 
+    BaseType_t status;
+    
+    status = xTaskCreatePinnedToCore(sampling_task, "sampling_task", 8192, NULL, 5, &samplingTaskHandle, ESP_CORE_0);
 
-
-    wifi_config_t home_wifi_config = {
-        .sta = {
-            .ssid = "NETGEAR56",
-            .password = "livelyoctopus070",
-            /* Authmode threshold resets to WPA2 as default if password matches WPA2 standards (password len => 8).
-             * If you want to connect the device to deprecated WEP/WPA networks, Please set the threshold value
-             * to WIFI_AUTH_WEP/WIFI_AUTH_WPA_PSK and set the password with length and format matching to
-             * WIFI_AUTH_WEP/WIFI_AUTH_WPA_PSK standards.
-             */
-            // .threshold.authmode = ESP_WIFI_SCAN_AUTH_MODE_THRESHOLD,
-            // .sae_pwe_h2e = ESP_WIFI_SAE_MODE,
-            // .sae_h2e_identifier = EXAMPLE_H2E_IDENTIFIER,
-        },
-    };
-
-    ESP_ERROR_CHECK(wifi_station_start_and_connect(&home_wifi_config, &error));
-    if (error)
+    if (status != pdPASS)
     {
-        ESP_LOGE(TAG, "%s: Failed to connect to home WIFI network\n", __func__);
+        ESP_LOGE(TAG, "%s Failed to create sampling task!\n", __func__);
         return;
     }
-    else
-    {
-        ESP_LOGI(TAG, "%s Connected to home WIFI network\n", __func__);
-    }
-
-    ESP_ERROR_CHECK(set_system_time());
-
-    ESP_LOGI(TAG, "%s: Disconnecting from home WiFi network\n", __func__);
-    ESP_ERROR_CHECK(wifi_station_disconnect_and_stop());
-
-    ESP_LOGI(TAG, "%s: Connecting to Audio Relay Wifi Network\n", __func__);
-
-    wifi_config_t audio_wifi_config = {
-        .sta = {
-            .ssid = AUDIO_NET_WIFI_SSID,
-            .password = AUDIO_NET_WIFI_PASS,
-            /* Authmode threshold resets to WPA2 as default if password matches WPA2 standards (password len => 8).
-             * If you want to connect the device to deprecated WEP/WPA networks, Please set the threshold value
-             * to WIFI_AUTH_WEP/WIFI_AUTH_WPA_PSK and set the password with length and format matching to
-             * WIFI_AUTH_WEP/WIFI_AUTH_WPA_PSK standards.
-             */
-            .threshold.authmode = ESP_WIFI_SCAN_AUTH_MODE_THRESHOLD,
-            .sae_pwe_h2e = ESP_WIFI_SAE_MODE,
-            .sae_h2e_identifier = EXAMPLE_H2E_IDENTIFIER,
-        },
-    };
-
-    // TODO: This needs to go in a try-loop in case the client comes up
-    //       before the server, or in case the server powers down, then
-    //       comes back up.
-    wifi_station_start_and_connect(&audio_wifi_config, &error);
-    BaseType_t status = xTaskCreatePinnedToCore(transmit_task, "transmit_task", 4096, NULL, 5, &transmitTaskHandle, ESP_CORE_0);
+    
+    status = xTaskCreatePinnedToCore(transmit_task, "transmit_task", 8192, NULL, 5, &transmitTaskHandle, ESP_CORE_1);
 
     if (status != pdPASS)
     {
@@ -641,11 +754,8 @@ void app_main(void)
         return;
     }
 
-    status = xTaskCreatePinnedToCore(sampling_task, "sampling_task", 4096, NULL, 5, &samplingTaskHandle, ESP_CORE_1);
+    // vTaskStartScheduler();
 
-    if (status != pdPASS)
-    {
-        ESP_LOGE(TAG, "%s Failed to create sampling task!\n", __func__);
-        return;
-    }
+    // We should never get here
+    // ESP_LOGE(TAG, "%s vTaskStartScheduler returned!\n", __func__);
 }
