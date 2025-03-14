@@ -59,6 +59,7 @@
 typedef struct AudioPacket_t
 {
     uint16_t seqnum;
+    bool     echo;
     uint16_t checksum;
     uint16_t payloadSize;
     uint8_t  payload[PAYLOAD_MAX_LEN];
@@ -379,9 +380,6 @@ void wifi_station_disconnect_and_stop(bool* error)
 ////////////////////////////////////////////////////////////////////
 void sampling_task()
 {
-    activePacket = &gAudioPackets[0];
-    backgroundPacket = &gAudioPackets[1];
-
     const uint32_t SAMPLE_RATE = 44100; // hz
     const uint32_t SAMPLE_PERIOD_MS = 10; //(uint32_t)(1.0f / SAMPLE_RATE / 1000);
 
@@ -549,7 +547,11 @@ void stream_audio_to_server(bool* error)
     struct timeval timeout;
     timeout.tv_sec = 10;
     timeout.tv_usec = 0;
-    setsockopt (sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof timeout);
+    setsockopt (sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    
+    // TODO: See if this helps xmit time at all
+    // bool dont_route = 1;
+    // setsockopt(sock, SOL_SOCKET, SO_DONTROUTE, &dont_route, sizeof(dont_route));
 
     ESP_LOGI(TAG, "Socket created, sending to %s:%d", HOST_IP_ADDR, PORT);
 
@@ -583,6 +585,7 @@ void stream_audio_to_server(bool* error)
 
         // CRC and transmit the audio packet
         activePacket->checksum = crc16(activePacket->payload, activePacket->payloadSize);
+        activePacket->echo = true;      // request an echo from the server
         uint32_t packetSize = sizeof(AudioPacket_t) - (PAYLOAD_MAX_LEN - activePacket->payloadSize);
         get_system_time(&timesent);
 
@@ -595,27 +598,27 @@ void stream_audio_to_server(bool* error)
         }
         ESP_LOGI(TAG, "Message sent");
 
-        // Receive ACK from server (this can be deleted later)
-        struct ResponsePacket_t response;
-        struct sockaddr_storage source_addr;
-        socklen_t socklen = sizeof(source_addr);
-        int len = recvfrom(sock, &response, sizeof(struct ResponsePacket_t) - 1, 0, (struct sockaddr *)&source_addr, &socklen);
+        // Receive echo from server (useful to measuring Wifi speeds)
+        if (activePacket->echo)
+        {
+            struct AudioPacket_t response;
+            struct sockaddr_storage source_addr;
+            socklen_t socklen = sizeof(source_addr);
+            int len = recvfrom(sock, &response, sizeof(response), 0, (struct sockaddr *)&source_addr, &socklen);
 
-        if (len < 0) {
-            ESP_LOGE(TAG, "Failed to receive response from server (errno = %d)", errno);
-            return;
-        }
-        else {
-            get_system_time(&timerecv);
-            response.response[4] = 0; // Null-terminate whatever we received and treat like a string
-            ESP_LOGI(TAG, "%s Received %d bytes from %s:", __func__, len, ipv4_str);
+            if (len < 0) {
+                ESP_LOGE(TAG, "Failed to receive response from server (errno = %d)", errno);
+                return;
+            }
+            else {
+                get_system_time(&timerecv);
+                ESP_LOGI(TAG, "%s Received %d bytes from %s. Seqnum = %u\n", __func__, len, ipv4_str, response.seqnum);
 
-            struct sockaddr_in * source_addr_in = (struct sockaddr_in *)&source_addr;
-            ESP_LOGI(TAG, "%s Source address: %s\n", __func__, inet_ntoa(source_addr_in->sin_addr));
-            ESP_LOGI(TAG, "%s Message content: %s", __func__, response.response);
+                struct sockaddr_in * source_addr_in = (struct sockaddr_in *)&source_addr;
+                ESP_LOGI(TAG, "%s Source address: %s\n", __func__, inet_ntoa(source_addr_in->sin_addr));
 
-
-            ESP_LOGI(TAG, "%s Round trip time: %lld\n", __func__, timerecv - timesent);
+                ESP_LOGI(TAG, "%s Round trip time: %lld\n", __func__, timerecv - timesent);
+            }
         }
 
         vTaskDelay(2000 / portTICK_PERIOD_MS);
@@ -721,6 +724,9 @@ void app_main(void)
     wifi_init_config_t cfg;
     ESP_ERROR_CHECK(wifi_setup_driver(&cfg));
 
+    activePacket = &gAudioPackets[0];
+    backgroundPacket = &gAudioPackets[1];
+
     /// Create transmit and sampling tasks
     // 
     // The sampling task is responsible for sampling audio
@@ -754,8 +760,4 @@ void app_main(void)
         return;
     }
 
-    // vTaskStartScheduler();
-
-    // We should never get here
-    // ESP_LOGE(TAG, "%s vTaskStartScheduler returned!\n", __func__);
 }
