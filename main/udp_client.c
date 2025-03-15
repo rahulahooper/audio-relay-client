@@ -65,19 +65,11 @@ typedef struct AudioPacket_t
     uint8_t  payload[PAYLOAD_MAX_LEN];
 } AudioPacket_t;
 
-typedef struct ResponsePacket_t
-{
-    uint16_t seqnum;
-    char     response[5];   // large enough to hold the "NACK" string
-} ResponsePacket_t;
-
 typedef enum TransmitTaskState_t
 {
-    HOME_NETWORK_CONNECT,
-    SET_SYSTEM_TIME,
-    NETWORK_DISCONNECT,
     RELAY_NETWORK_CONNECT,
     STREAM_TO_SERVER,
+    NETWORK_DISCONNECT,
 } TransmitTaskState_t;
 
 static TransmitTaskState_t transmitTaskState;
@@ -139,62 +131,11 @@ uint16_t crc16(uint8_t* data, uint32_t len)
 
 
 ////////////////////////////////////////////////////////////////////
-// set_system_time()
-//
-// Connects to a Network Time Protocol (NTP) server for setting the
-// ESP32 clock. The function disconnects from the server at exit.
-// The ESP32 must be connected to the Internet before entering this
-// function (see wifi_station_start_and_connect()).
-////////////////////////////////////////////////////////////////////
-esp_err_t set_system_time()
-{
-    ESP_LOGI(TAG, "%s Initializing sntp network interface\n", __func__);
-
-    // TODO: Verify that we are connected to a Wifi network before connecting
-    //       to the NTP server
-    esp_sntp_config_t config = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
-    config.start = false;               // wait for Wifi connection before starting SNTP service
-    config.server_from_dhcp = true;     // use DHCP server to get SNTP IP address
-    config.smooth_sync = true;          // gradually reduce time error
-    ESP_ERROR_CHECK(esp_netif_sntp_init(&config));
-
-    ESP_LOGI(TAG, "%s Starting SNTP client\n", __func__);
-    ESP_ERROR_CHECK(esp_netif_sntp_start());
-
-    time_t now = 0;
-    struct tm timeinfo = { 0 };
-    esp_err_t ret = esp_netif_sntp_sync_wait(pdMS_TO_TICKS(10000));
-    if (ret != ESP_OK)
-    {
-        ESP_LOGE(TAG, "%s: Failed to update system time within 10s timeout! error = %s\n", __func__, esp_err_to_name(ret));
-        return ESP_OK;
-    }
-
-    time(&now);
-    localtime_r(&now, &timeinfo);
-    ESP_LOGI(TAG, "%s: Connected to SNTP server!\n", __func__);
-
-    esp_netif_sntp_deinit();
-
-    char strftime_buf[64];
-
-    // Set timezone to Eastern Standard Time and print local time
-    setenv("TZ", "EST5EDT,M3.2.0/2,M11.1.0", 1);
-    tzset();
-    localtime_r(&now, &timeinfo);
-    strftime(strftime_buf, sizeof(strftime_buf), "%c", &timeinfo);
-    ESP_LOGI(TAG, "The current date/time in New York is: %s", strftime_buf);
-
-    return ESP_OK;
-}   
-
-
-////////////////////////////////////////////////////////////////////
 // get_system_time()
 //
-// Return time since epoch in microseconds. If system time is not
-// set properly (see set_system_time), results won't reflect the 
-// actual time.
+// Return time since epoch in microseconds. This function is mostly
+// useful for measuring durations. It doesn't return a true time
+// of day.
 ////////////////////////////////////////////////////////////////////
 void get_system_time(int64_t* time_us)
 {
@@ -432,43 +373,6 @@ void sampling_task()
     vTaskDelete(NULL);
 }
 
-////////////////////////////////////////////////////////////////////
-// home_wifi_connect()
-//
-////////////////////////////////////////////////////////////////////
-void home_wifi_connect(bool* error)
-{
-    ESP_LOGI(TAG, "%s Connecting to home WIFI network\n", __func__);
-    *error = true;
-
-    wifi_config_t home_wifi_config = {
-        .sta = {
-            .ssid = "NETGEAR56",
-            .password = "livelyoctopus070",
-            /* Authmode threshold resets to WPA2 as default if password matches WPA2 standards (password len => 8).
-             * If you want to connect the device to deprecated WEP/WPA networks, Please set the threshold value
-             * to WIFI_AUTH_WEP/WIFI_AUTH_WPA_PSK and set the password with length and format matching to
-             * WIFI_AUTH_WEP/WIFI_AUTH_WPA_PSK standards.
-             */
-            // .threshold.authmode = ESP_WIFI_SCAN_AUTH_MODE_THRESHOLD,
-            // .sae_pwe_h2e = ESP_WIFI_SAE_MODE,
-            // .sae_h2e_identifier = EXAMPLE_H2E_IDENTIFIER,
-        },
-    };
-
-    wifi_station_start_and_connect(&home_wifi_config, error);
-    if (*error)
-    {
-        ESP_LOGE(TAG, "%s: Failed to connect to home WIFI network\n", __func__);
-        return;
-    }
-    else
-    {
-        ESP_LOGI(TAG, "%s Connected to home WIFI network\n", __func__);
-    }
-
-}
-
 
 ////////////////////////////////////////////////////////////////////
 // relay_network_connect 
@@ -635,32 +539,13 @@ void stream_audio_to_server(bool* error)
 static void transmit_task(void *pvParameters)
 {
 
+    transmitTaskState = RELAY_NETWORK_CONNECT;
+
     while (1) {
 
         bool error;
         switch (transmitTaskState)
         {
-            case HOME_NETWORK_CONNECT:
-            {
-                home_wifi_connect(&error);
-
-                transmitTaskState = error ? NETWORK_DISCONNECT : SET_SYSTEM_TIME;
-                break;
-            }
-            case SET_SYSTEM_TIME:
-            {
-                set_system_time();
-
-                transmitTaskState = NETWORK_DISCONNECT;
-                break;
-            }
-            case NETWORK_DISCONNECT:
-            {
-                wifi_station_disconnect_and_stop(&error);
-
-                transmitTaskState = RELAY_NETWORK_CONNECT;
-                break;
-            }
             case RELAY_NETWORK_CONNECT:
             {
                 relay_network_connect(&error);
@@ -675,21 +560,25 @@ static void transmit_task(void *pvParameters)
                 {
                     transmitTaskState = STREAM_TO_SERVER;
                 }
-            }
                 break;
+            }
             case STREAM_TO_SERVER:
             {
                 // This function should ideally never return
                 stream_audio_to_server(&error);
-
                 transmitTaskState = NETWORK_DISCONNECT;
-            }
                 break;
+            }
+            case NETWORK_DISCONNECT:
+            {
+                wifi_station_disconnect_and_stop(&error);
+                transmitTaskState = RELAY_NETWORK_CONNECT;
+                break;
+            }
             default:
                 ESP_LOGE(TAG, "%s, Invalid state %u\n", __func__, transmitTaskState);
                 break;
         }
-
     }
     
     ESP_LOGE(TAG, "%s Terminating transmit task\n", __func__);
@@ -704,10 +593,6 @@ void app_main(void)
     
     #if CONFIG_ESP_WIFI_AUTH_WPA3_PSK             // use this one
     ESP_LOGI(TAG, "WPA3_PSK selected!");
-    #endif
-
-    #ifdef CONFIG_LWIP_DHCP_GET_NTP_SRV
-    ESP_LOGI(TAG, "%s LWIP config'd\n", __func__);
     #endif
 
     uint32_t num_cores = configNUM_CORES;
