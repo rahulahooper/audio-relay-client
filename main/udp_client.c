@@ -79,8 +79,10 @@ typedef struct AudioPacket_t
 typedef enum TransmitTaskState_t
 {
     RELAY_NETWORK_CONNECT,
+    CREATE_SOCKET,
     STREAM_TO_SERVER,
-    NETWORK_DISCONNECT,
+    DESTROY_SOCKET,
+    RELAY_NETWORK_DISCONNECT,
 } TransmitTaskState_t;
 
 static TransmitTaskState_t transmitTaskState;
@@ -478,12 +480,11 @@ void relay_network_connect(bool * error)
     wifi_station_start_and_connect(&audio_wifi_config, error);
 }
 
-
 ////////////////////////////////////////////////////////////////////
-// stream_audio_to_server 
+// create_socket() 
 //
 ////////////////////////////////////////////////////////////////////
-void stream_audio_to_server(bool* error)
+void create_socket(bool* error, int* sock, struct sockaddr_in* dest_addr)
 {
     *error = true;
 
@@ -503,38 +504,55 @@ void stream_audio_to_server(bool* error)
     ipv4_addr.s_addr = ip_info->gw.addr;
     if (inet_ntop(AF_INET, &ipv4_addr, ipv4_str, INET_ADDRSTRLEN) != NULL)
     {
-
         ESP_LOGI(TAG, "Gateway IPv4: %s", ipv4_str);
     }
+
+    // Fill in IP address in return object
+    dest_addr->sin_addr.s_addr = inet_addr(ipv4_str);
+    dest_addr->sin_family = AF_INET;
+    dest_addr->sin_port = htons(PORT);
 
     // Set up socket connection with server
     int addr_family = 0;
     int ip_protocol = 0;
 
-    struct sockaddr_in dest_addr;
-    dest_addr.sin_addr.s_addr = inet_addr(ipv4_str);
-    dest_addr.sin_family = AF_INET;
-    dest_addr.sin_port = htons(PORT);
     addr_family = AF_INET;
     ip_protocol = IPPROTO_IP;
     
-    int sock = socket(addr_family, SOCK_DGRAM, ip_protocol);
-    if (sock < 0) {
+    *sock = socket(addr_family, SOCK_DGRAM, ip_protocol);
+    if (*sock < 0) {
         ESP_LOGE(TAG, "Unable to create socket: errno %d", errno);
         return;
     }
 
-    // Set timeout
+    // Set timeout for receiving echoes from server
     struct timeval timeout;
-    timeout.tv_sec = 10;
-    timeout.tv_usec = 0;
-    setsockopt (sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    timeout.tv_sec = 0;
+    timeout.tv_usec = 20000;   // 20ms
+    setsockopt(*sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
     
     // TODO: See if this helps xmit time at all
     // bool dont_route = 1;
     // setsockopt(sock, SOL_SOCKET, SO_DONTROUTE, &dont_route, sizeof(dont_route));
 
     ESP_LOGI(TAG, "Socket created, sending to %s:%d", HOST_IP_ADDR, PORT);
+    *error = false;
+}
+
+
+////////////////////////////////////////////////////////////////////
+// stream_audio_to_server 
+//
+////////////////////////////////////////////////////////////////////
+void stream_audio_to_server(bool* error, const int sock, const struct sockaddr_in dest_addr)
+{
+    *error = true;
+
+    if (sock < 0)
+    {
+        ESP_LOGI(TAG, "%s Socket was invalid\n", __func__);
+        return;
+    }
 
     int64_t timesent, timerecv;
 
@@ -564,21 +582,24 @@ void stream_audio_to_server(bool* error)
             continue;
         }
 
-        // CRC and transmit the audio packet
+        // CRC, timestamp, and transmit the audio packet
         activePacket->checksum = crc16(activePacket->payload, activePacket->payloadSize);
         activePacket->echo = !(activePacket->seqnum % 50);      // request an echo from the server every 100 packets
         uint32_t packetSize = sizeof(AudioPacket_t) - (PAYLOAD_MAX_LEN - activePacket->payloadSize);
+
         get_system_time(&timesent);
 
         PRINTF_DEBUG((TAG, "%s Sending packet with seqnum %u, payload len %u, CRC 0x%x to server.\n",
             __func__, activePacket->seqnum, activePacket->payloadSize, activePacket->checksum));
+
         int err = sendto(sock, activePacket, packetSize, 0, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
+
         if (err < 0) {
             ESP_LOGE(TAG, "Error occurred during sending: errno %s", strerror(errno));
             return;
         }
 
-        // Receive echo from server (useful to measuring Wifi speeds)
+        // Optionally receive echo'd packet from server (useful to measuring Wifi speeds)
         if (activePacket->echo)
         {
             struct AudioPacket_t response;
@@ -588,20 +609,15 @@ void stream_audio_to_server(bool* error)
 
             if (len < 0) {
                 ESP_LOGE(TAG, "Failed to receive response from server (errno = %s)", strerror(errno));
-                return;
             }
             else {
                 get_system_time(&timerecv);
-                ESP_LOGI(TAG, "%s Received %d bytes from %s. Seqnum = %u, payload size = %u\n", __func__, len, ipv4_str, response.seqnum, response.payloadSize);
-
-                struct sockaddr_in * source_addr_in = (struct sockaddr_in *)&source_addr;
-                ESP_LOGI(TAG, "%s Source address: %s\n", __func__, inet_ntoa(source_addr_in->sin_addr));
-
+                ESP_LOGI(TAG, "%s Received %d bytes. Seqnum = %u, payload size = %u\n", __func__, len, response.seqnum, response.payloadSize);
                 ESP_LOGI(TAG, "%s Round trip time: %lld\n", __func__, timerecv - timesent);
             }
         }
 
-        vTaskDelay(50 / portTICK_PERIOD_MS);
+        vTaskDelay(10 / portTICK_PERIOD_MS);
     }
 
 }
@@ -617,9 +633,13 @@ static void transmit_task(void *pvParameters)
 
     transmitTaskState = RELAY_NETWORK_CONNECT;
 
+
     while (1) {
 
         bool error;
+        static int socket = -1;
+        struct sockaddr_in dest_addr;   // stores IP information about server
+
         switch (transmitTaskState)
         {
             case RELAY_NETWORK_CONNECT:
@@ -629,11 +649,27 @@ static void transmit_task(void *pvParameters)
                 if (error)
                 {
                     ESP_LOGI(TAG, "%s Failed to connect to relay network. Retrying...\n", __func__);
-                    transmitTaskState = NETWORK_DISCONNECT;
+                    transmitTaskState = RELAY_NETWORK_DISCONNECT;
                     vTaskDelay(1000 / portTICK_PERIOD_MS);
                 }
                 else
                 {
+                    transmitTaskState = CREATE_SOCKET;
+                }
+                break;
+            }
+            case CREATE_SOCKET:
+            {
+                create_socket(&error, &socket, &dest_addr);
+
+                if (error)
+                {
+                    ESP_LOGE(TAG, "%s Failed to create socket. Disconnecting from network and retrying...\n", __func__);
+                    transmitTaskState = DESTROY_SOCKET;
+                }
+                else
+                {
+                    ESP_LOGI(TAG, "%s transitioning to STREAM_TO_SERVER, sock = %d\n", __func__, socket);
                     transmitTaskState = STREAM_TO_SERVER;
                 }
                 break;
@@ -641,11 +677,25 @@ static void transmit_task(void *pvParameters)
             case STREAM_TO_SERVER:
             {
                 // This function should ideally never return
-                stream_audio_to_server(&error);
-                transmitTaskState = NETWORK_DISCONNECT;
+                stream_audio_to_server(&error, socket, dest_addr);
+                transmitTaskState = DESTROY_SOCKET;
                 break;
             }
-            case NETWORK_DISCONNECT:
+            case DESTROY_SOCKET:
+            {
+                if((close(socket) < 0) && (errno == EINTR))
+                {
+                    // operation was interrupted by signal, retry
+                    break;
+                }
+                else
+                {
+                    socket = -1;
+                    transmitTaskState = RELAY_NETWORK_DISCONNECT;
+                    break;
+                }
+            }
+            case RELAY_NETWORK_DISCONNECT:
             {
                 wifi_station_disconnect_and_stop(&error);
                 transmitTaskState = RELAY_NETWORK_CONNECT;
