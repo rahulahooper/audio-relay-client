@@ -28,6 +28,8 @@
 #include "lwip/sys.h"
 #include <lwip/netdb.h>
 
+#include "driver/gptimer.h"
+
 #ifdef CONFIG_EXAMPLE_SOCKET_IP_INPUT_STDIN
 #include "addr_from_stdin.h"
 #endif
@@ -56,12 +58,21 @@
 
 #define min(a,b) ((a) < (b) ? (a) : (b))
 
+#define DEBUG 0
+
+#if DEBUG
+    #define PRINTF_DEBUG( msg ) ESP_LOGI msg
+#else
+    #define PRINTF_DEBUG( msg )
+#endif
+
 typedef struct AudioPacket_t
 {
     uint16_t seqnum;
     bool     echo;
-    uint16_t checksum;
     uint16_t payloadSize;
+    uint16_t payloadStart;              // start index of audio data in <payload>
+    uint16_t checksum;
     uint8_t  payload[PAYLOAD_MAX_LEN];
 } AudioPacket_t;
 
@@ -315,14 +326,50 @@ void wifi_station_disconnect_and_stop(bool* error)
 
 
 ////////////////////////////////////////////////////////////////////
+// timer_isr_handler 
+//
+// Timer interrupt handler for sampling task
+////////////////////////////////////////////////////////////////////
+static bool IRAM_ATTR timer_isr_handler(gptimer_handle_t timer, const gptimer_alarm_event_data_t* edata, void* user_ctx)
+{
+
+    (void)timer;
+    (void)edata;
+    (void)user_ctx;
+
+    static uint32_t i = 0;      // counter is stored in static memory so that it persists across interrupts
+
+    if (backgroundPacket->payloadSize == 0) // main sampling_task is responsible for resetting this parameter
+    {
+        // reset the counter
+        i = 0;
+    }
+
+    backgroundPacket->payload[i] = random() & 0xFF;
+    
+    if (backgroundPacket->payloadSize == PAYLOAD_MAX_LEN)
+    {
+        // handle wrap-around logic
+        i = (i+1) % PAYLOAD_MAX_LEN;
+        backgroundPacket->payloadStart = (backgroundPacket->payloadStart + 1) % PAYLOAD_MAX_LEN;
+    }
+    else
+    {
+        i++;
+        backgroundPacket->payloadSize++;
+    }
+
+    return pdFALSE;
+}
+
+
+////////////////////////////////////////////////////////////////////
 // sampling_task 
 //
 // Main event loop for sampling audio data
 ////////////////////////////////////////////////////////////////////
 void sampling_task()
 {
-    const uint32_t SAMPLE_RATE = 44100; // hz
-    const uint32_t SAMPLE_PERIOD_MS = 10; //(uint32_t)(1.0f / SAMPLE_RATE / 1000);
 
     while (transmitTaskHandle == NULL)
     {
@@ -330,33 +377,59 @@ void sampling_task()
         vTaskDelay(500 / portTICK_PERIOD_MS);
     }
 
-    uint16_t seqnum = 0;
+    // Set up sampling interrupt
+    const uint32_t SAMPLE_RATE = 44100; // hz
+    const uint32_t MICROSECONDS_PER_SAMPLE = (uint32_t)(1.0f / SAMPLE_RATE * 1000 * 1000);
+    const uint32_t CLK_RES = 1 * 1000 * 1000;         // 1 MHz
+    const uint32_t CLK_TICKS_PER_MICROSECOND = CLK_RES / 1000 / 1000;
+
+    gptimer_handle_t gpTimerHandle = NULL;
+    gptimer_config_t gpTimerConfig = 
+    {
+        .clk_src       = GPTIMER_CLK_SRC_DEFAULT,
+        .direction     = GPTIMER_COUNT_UP,
+        .resolution_hz = CLK_RES,               // 1 MHz
+        .intr_priority = 3,
+    };
+
+    gptimer_alarm_config_t gpAlarmConfig = 
+    {
+        .alarm_count = MICROSECONDS_PER_SAMPLE * CLK_TICKS_PER_MICROSECOND,
+        .reload_count = 0,
+        .flags = 
+        {
+            .auto_reload_on_alarm = true,
+        },
+    };
+
+    gptimer_event_callbacks_t gpTimerEventCallback =
+    {
+        .on_alarm = timer_isr_handler,
+    };
+
+    ESP_ERROR_CHECK(gptimer_new_timer(&gpTimerConfig, &gpTimerHandle));
+    ESP_ERROR_CHECK(gptimer_set_alarm_action(gpTimerHandle, &gpAlarmConfig));
+    ESP_ERROR_CHECK(gptimer_register_event_callbacks(gpTimerHandle, &gpTimerEventCallback, NULL));
+    ESP_ERROR_CHECK(gptimer_enable(gpTimerHandle));
 
     while (true)
     {
 
-        vTaskDelay(10 / portTICK_PERIOD_MS);
-        backgroundPacket->seqnum = ++seqnum;
-        backgroundPacket->checksum = 0;
-        backgroundPacket->payloadSize = 0;
-
-        uint32_t i = 0;
+        ESP_ERROR_CHECK(gptimer_start(gpTimerHandle));
 
         // keep sampling until the transmit thread is done sending the active packet
-        while (!ulTaskNotifyTakeIndexed(transmissionDoneNotifyIndex, pdTRUE, 0))
+        while (!ulTaskNotifyTakeIndexed(transmissionDoneNotifyIndex, pdTRUE, portMAX_DELAY))
         {
-            backgroundPacket->payload[i] = (uint8_t)(random() & 0xFF);
-            backgroundPacket->payloadSize = min(backgroundPacket->payloadSize+1, PAYLOAD_MAX_LEN);
-            i = (i+1) % PAYLOAD_MAX_LEN;
-
-            // sampling should probably be interrupt driven to allow for precise timing.
-            // this thread can just block until a sample is ready / all samples are ready.
-            // for now just sleep
-            vTaskDelay(SAMPLE_PERIOD_MS / portTICK_PERIOD_MS);
+            PRINTF_DEBUG((TAG, "%s Waiting on transmission done\n", __func__));
+            vTaskDelay(1);
         }
 
-        ESP_LOGI(TAG, "%s Transmission Done!\n", __func__);
+        PRINTF_DEBUG((TAG, "%s Transmission Done!\n", __func__));
         
+        ESP_ERROR_CHECK(gptimer_stop(gpTimerHandle));
+
+        PRINTF_DEBUG((TAG, "%s Stopped timer\n", __func__));
+
         // At this point, the transmit thread is waiting for a data ready signal and is
         // therefore not sending any data. It is safe to swap the active and background
         // packets.
@@ -364,9 +437,13 @@ void sampling_task()
         activePacket = backgroundPacket;
         backgroundPacket = tmp;
 
-        ESP_LOGI(TAG, "%s Notifying transmission task that new data is available\n", __func__);
+        PRINTF_DEBUG((TAG, "%s Notifying transmission task that new data is available\n", __func__));
         xTaskNotifyGiveIndexed(transmitTaskHandle, dataReadyNotifyIndex);
 
+        backgroundPacket->seqnum = activePacket->seqnum + 1;
+        backgroundPacket->checksum = 0;
+        backgroundPacket->payloadSize = 0;
+        backgroundPacket->payloadStart = 0;;
     }
 
     ESP_LOGE(TAG, "%s Terminating sampling task", __func__);
@@ -471,15 +548,15 @@ void stream_audio_to_server(bool* error)
     // Stream audio data to server
     while (1) {
 
-        // Indicate to sampling thread that there is not data to transmit
-        ESP_LOGI(TAG, "%s Notifying of transmission done.\n", __func__);
+        // Indicate to sampling thread that there is no data to transmit
+        PRINTF_DEBUG((TAG, "%s Notifying of transmission done.\n", __func__));
         xTaskNotifyGiveIndexed(samplingTaskHandle, transmissionDoneNotifyIndex);
 
         // Wait for the sampling task to indicate that there is new data available
-        ESP_LOGI(TAG, "%s Waiting for data ready.\n", __func__);
+        PRINTF_DEBUG((TAG, "%s Waiting for data ready.\n", __func__));
         if(ulTaskNotifyTakeIndexed(dataReadyNotifyIndex, pdTRUE, pdMS_TO_TICKS(1000)))
         {
-            ESP_LOGI(TAG, "%s Got data ready notification.\n", __func__);
+            PRINTF_DEBUG((TAG, "%s Got data ready notification.\n", __func__));
         }
         else
         {
@@ -489,18 +566,17 @@ void stream_audio_to_server(bool* error)
 
         // CRC and transmit the audio packet
         activePacket->checksum = crc16(activePacket->payload, activePacket->payloadSize);
-        activePacket->echo = true;      // request an echo from the server
+        activePacket->echo = !(activePacket->seqnum % 50);      // request an echo from the server every 100 packets
         uint32_t packetSize = sizeof(AudioPacket_t) - (PAYLOAD_MAX_LEN - activePacket->payloadSize);
         get_system_time(&timesent);
 
-        ESP_LOGI(TAG, "%s Sending packet with payload len %u and CRC 0x%x to server.\n",
-            __func__, activePacket->payloadSize, activePacket->checksum);
+        PRINTF_DEBUG((TAG, "%s Sending packet with seqnum %u, payload len %u, CRC 0x%x to server.\n",
+            __func__, activePacket->seqnum, activePacket->payloadSize, activePacket->checksum));
         int err = sendto(sock, activePacket, packetSize, 0, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
         if (err < 0) {
-            ESP_LOGE(TAG, "Error occurred during sending: errno %d", errno);
+            ESP_LOGE(TAG, "Error occurred during sending: errno %s", strerror(errno));
             return;
         }
-        ESP_LOGI(TAG, "Message sent");
 
         // Receive echo from server (useful to measuring Wifi speeds)
         if (activePacket->echo)
@@ -511,12 +587,12 @@ void stream_audio_to_server(bool* error)
             int len = recvfrom(sock, &response, sizeof(response), 0, (struct sockaddr *)&source_addr, &socklen);
 
             if (len < 0) {
-                ESP_LOGE(TAG, "Failed to receive response from server (errno = %d)", errno);
+                ESP_LOGE(TAG, "Failed to receive response from server (errno = %s)", strerror(errno));
                 return;
             }
             else {
                 get_system_time(&timerecv);
-                ESP_LOGI(TAG, "%s Received %d bytes from %s. Seqnum = %u\n", __func__, len, ipv4_str, response.seqnum);
+                ESP_LOGI(TAG, "%s Received %d bytes from %s. Seqnum = %u, payload size = %u\n", __func__, len, ipv4_str, response.seqnum, response.payloadSize);
 
                 struct sockaddr_in * source_addr_in = (struct sockaddr_in *)&source_addr;
                 ESP_LOGI(TAG, "%s Source address: %s\n", __func__, inet_ntoa(source_addr_in->sin_addr));
@@ -525,7 +601,7 @@ void stream_audio_to_server(bool* error)
             }
         }
 
-        vTaskDelay(2000 / portTICK_PERIOD_MS);
+        vTaskDelay(50 / portTICK_PERIOD_MS);
     }
 
 }
@@ -611,6 +687,8 @@ void app_main(void)
 
     activePacket = &gAudioPackets[0];
     backgroundPacket = &gAudioPackets[1];
+    memset(activePacket, 0, sizeof(AudioPacket_t));
+    memset(backgroundPacket, 0, sizeof(AudioPacket_t));
 
     /// Create transmit and sampling tasks
     // 
