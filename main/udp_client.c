@@ -52,10 +52,10 @@
 #define EXAMPLE_H2E_IDENTIFIER ""
 #define ESP_WIFI_SCAN_AUTH_MODE_THRESHOLD WIFI_AUTH_WPA3_PSK
 
-#define ESP_CORE_0  0       // physical core 0
-#define ESP_CORE_1  1       // physical core 1
+#define ESP_CORE_0  0           // physical core 0
+#define ESP_CORE_1  1           // physical core 1
 #define PAYLOAD_MAX_LEN 996
-
+#define MAX_SEND_ATTEMPTS 3     // maximum attempts to send a single audio packet
 #define min(a,b) ((a) < (b) ? (a) : (b))
 
 #define DEBUG 0
@@ -592,11 +592,30 @@ void stream_audio_to_server(bool* error, const int sock, const struct sockaddr_i
         PRINTF_DEBUG((TAG, "%s Sending packet with seqnum %u, payload len %u, CRC 0x%x to server.\n",
             __func__, activePacket->seqnum, activePacket->payloadSize, activePacket->checksum));
 
-        int err = sendto(sock, activePacket, packetSize, 0, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
+        for (int i = 0; i < MAX_SEND_ATTEMPTS; i++)
+        {
+            int err = sendto(sock, activePacket, packetSize, 0, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
 
-        if (err < 0) {
-            ESP_LOGE(TAG, "Error occurred during sending: errno %s", strerror(errno));
-            return;
+            if (err < 0) {
+                if (errno == ENOMEM)
+                {
+                    PRINTF_DEBUG((TAG, "%s Failed to send packet w/seqnum %u over socket. Error is likely full send buffer. Retrying (%u/%u)\n",
+                        __func__, activePacket->seqnum, i+1, MAX_SEND_ATTEMPTS));
+                    vTaskDelay(1);
+                    continue;
+                }
+
+                ESP_LOGE(TAG, "%s Error sending packet %u: errno %u (%s)", __func__, activePacket->seqnum, errno, strerror(errno));
+
+                // TODO: Check connection with server and exit if we are disconnected
+                wifi_ap_record_t ap;
+                if (esp_wifi_sta_get_ap_info(&ap) == ESP_ERR_WIFI_NOT_CONNECT)
+                {
+                    ESP_LOGE(TAG, "%s Disconnected from server. Exiting transmit loop\n", __func__);
+                    return;
+                }
+            }
+
         }
 
         // Optionally receive echo'd packet from server (useful to measuring Wifi speeds)
@@ -608,7 +627,7 @@ void stream_audio_to_server(bool* error, const int sock, const struct sockaddr_i
             int len = recvfrom(sock, &response, sizeof(response), 0, (struct sockaddr *)&source_addr, &socklen);
 
             if (len < 0) {
-                ESP_LOGE(TAG, "Failed to receive response from server (errno = %s)", strerror(errno));
+                ESP_LOGE(TAG, "%s Failed to receive echo'd packet %u from server (errno = %s)", __func__, activePacket->seqnum, strerror(errno));
             }
             else {
                 get_system_time(&timerecv);
@@ -617,7 +636,7 @@ void stream_audio_to_server(bool* error, const int sock, const struct sockaddr_i
             }
         }
 
-        vTaskDelay(10 / portTICK_PERIOD_MS);
+        vTaskDelay(5 / portTICK_PERIOD_MS);
     }
 
 }
