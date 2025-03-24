@@ -19,6 +19,7 @@
 #include "nvs_flash.h"
 #include "esp_netif.h"
 #include "protocol_examples_common.h"
+#include "rom/ets_sys.h"
 
 #include "esp_sntp.h"
 #include "esp_netif_sntp.h"
@@ -563,6 +564,20 @@ void stream_audio_to_server(bool* error, const int sock, const struct sockaddr_i
         vTaskDelay(500 / portTICK_PERIOD_MS);
     }
 
+    // Init some statistics-related variables
+    uint32_t bytesSinceLastEcho = 0;
+    uint32_t packetsSinceLastEcho = 0;
+    int64_t timeOfLastEcho;
+    get_system_time(&timeOfLastEcho);
+
+    // To ensure that the server always has data to play
+    // we want to minimize variations in transmit time. To do this, we can
+    // artificially constrain the transmit loop to take a specific
+    // amount of time `TX_TIME_MS`
+    const uint32_t TX_TIME_MS = 5;
+    int64_t looptime;
+    get_system_time(&looptime);
+
     // Stream audio data to server
     while (1) {
 
@@ -570,7 +585,20 @@ void stream_audio_to_server(bool* error, const int sock, const struct sockaddr_i
         PRINTF_DEBUG((TAG, "%s Notifying of transmission done.\n", __func__));
         xTaskNotifyGiveIndexed(samplingTaskHandle, transmissionDoneNotifyIndex);
 
+        int64_t timenow;
+        get_system_time(&timenow);
+
+        // TODO: Block here so that the sampling task can accumulate a 
+        // not-insignificant amount of data
+        // 
+        // Since the FreeRTOS API doesn't provide a way to block at
+        // microsecond resolution and will throw a watchdog exception
+        // if we use the ESP32 ets_us_delay() function, we need to set up
+        // a one-shot timer that wakes up this task after we've reached
+        // `TX_TIME_MS`. 
+
         // Wait for the sampling task to indicate that there is new data available
+        // (Ideally, this should not block at all because we just blocked earlier)
         PRINTF_DEBUG((TAG, "%s Waiting for data ready.\n", __func__));
         if(ulTaskNotifyTakeIndexed(dataReadyNotifyIndex, pdTRUE, pdMS_TO_TICKS(1000)))
         {
@@ -584,7 +612,7 @@ void stream_audio_to_server(bool* error, const int sock, const struct sockaddr_i
 
         // CRC, timestamp, and transmit the audio packet
         activePacket->checksum = crc16(activePacket->payload, activePacket->payloadSize);
-        activePacket->echo = !(activePacket->seqnum % 50);      // request an echo from the server every 100 packets
+        activePacket->echo = !(activePacket->seqnum % 500);      // request an echo from the server 
         uint32_t packetSize = sizeof(AudioPacket_t) - (PAYLOAD_MAX_LEN - activePacket->payloadSize);
 
         get_system_time(&timesent);
@@ -618,6 +646,10 @@ void stream_audio_to_server(bool* error, const int sock, const struct sockaddr_i
 
         }
 
+        // Update packet statistics
+        bytesSinceLastEcho += activePacket->payloadSize;
+        packetsSinceLastEcho++;
+
         // Optionally receive echo'd packet from server (useful to measuring Wifi speeds)
         if (activePacket->echo)
         {
@@ -634,9 +666,18 @@ void stream_audio_to_server(bool* error, const int sock, const struct sockaddr_i
                 ESP_LOGI(TAG, "%s Received %d bytes. Seqnum = %u, payload size = %u\n", __func__, len, response.seqnum, response.payloadSize);
                 ESP_LOGI(TAG, "%s Round trip time: %lld\n", __func__, timerecv - timesent);
             }
-        }
 
-        vTaskDelay(5 / portTICK_PERIOD_MS);
+            // Report transmit statistics
+            uint32_t avgPacketSize = bytesSinceLastEcho / packetsSinceLastEcho;
+            float avgThroughput = 1.0f * bytesSinceLastEcho / (timerecv - timeOfLastEcho) * 1000 * 1000;
+
+            ESP_LOGI(TAG, "%s Average packet size = %lu, average throughput (bytes/sec) = %f\n", 
+                __func__, avgPacketSize, avgThroughput);
+
+            timeOfLastEcho = timerecv;
+            bytesSinceLastEcho = 0;
+            packetsSinceLastEcho = 0;
+        }
     }
 
 }
