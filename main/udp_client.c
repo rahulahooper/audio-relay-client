@@ -91,11 +91,8 @@ static TransmitTaskState_t transmitTaskState;
 /* FreeRTOS event group to signal when we are connected*/
 static EventGroupHandle_t s_wifi_event_group;
 
-/* The event group allows multiple bits for each event, but we only care about two events:
- * - we are connected to the AP with an IP
- * - we failed to connect after the maximum amount of retries */
+// Set this bit when we connect to a Wifi network
 #define WIFI_CONNECTED_BIT BIT0
-#define WIFI_FAIL_BIT      BIT1
 
 static const char *TAG = "wifi station";
 static int gWifiConnectAttempts = 0;
@@ -169,16 +166,11 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
 {
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
-    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        if (gWifiConnectAttempts < EXAMPLE_ESP_MAXIMUM_RETRY) {
-            esp_wifi_connect();
-            gWifiConnectAttempts++;
-            ESP_LOGI(TAG, "%s Failed to connect to the AP, retrying (attempt #%u)\n", __func__, gWifiConnectAttempts);
-        } else {
-            xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
-            gWifiConnectAttempts = 0;
-        }
-        ESP_LOGI(TAG,"connect to the AP fail");
+    } 
+    else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        esp_wifi_connect();
+        gWifiConnectAttempts++;
+        ESP_LOGI(TAG, "%s Failed to connect to the AP, retrying (attempt #%u)\n", __func__, gWifiConnectAttempts);
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
         ESP_LOGI(TAG, "got ip:" IPSTR, IP2STR(&event->ip_info.ip));
@@ -253,9 +245,9 @@ void wifi_station_start_and_connect(wifi_config_t* wifi_config, bool* error)
     // Wait until either the connection is established (WIFI_CONNECTED_BIT) or 
     // connection failed after the maximum number of re-tries (WIFI_FAIL_BIT). 
     // The bits are set by wifi_event_handler() (see above)
-    xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
+    xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
     EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
-            WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
+            WIFI_CONNECTED_BIT,
             pdFALSE,
             pdFALSE,
             portMAX_DELAY);
@@ -267,11 +259,6 @@ void wifi_station_start_and_connect(wifi_config_t* wifi_config, bool* error)
         ESP_LOGI(TAG, "%s: connected to ap SSID:%s password:%s",
                 __func__, ssid, password);
         *error = false;
-    } 
-    else if (bits & WIFI_FAIL_BIT) 
-    {
-        ESP_LOGI(TAG, "%s: Failed to connect to SSID:%s, password:%s",
-                __func__, ssid, password);
     } 
     else 
     {
@@ -420,8 +407,10 @@ void sampling_task()
 
         ESP_ERROR_CHECK(gptimer_start(gpTimerHandle));
 
-        // keep sampling until the transmit thread is done sending the active packet
-        while (!ulTaskNotifyTakeIndexed(transmissionDoneNotifyIndex, pdTRUE, portMAX_DELAY))
+        // keep sampling until 
+        //    a) the transmit thread is done sending the active packet
+        //    b) we've collected sufficient data to send in a packet
+        while ((backgroundPacket->payloadSize < 256) || !ulTaskNotifyTakeIndexed(transmissionDoneNotifyIndex, pdTRUE, portMAX_DELAY))
         {
             PRINTF_DEBUG((TAG, "%s Waiting on transmission done\n", __func__));
             vTaskDelay(1);
@@ -439,16 +428,17 @@ void sampling_task()
         AudioPacket_t * tmp = activePacket;
         activePacket = backgroundPacket;
         backgroundPacket = tmp;
+        backgroundPacket->seqnum = activePacket->seqnum + 1;
 
         PRINTF_DEBUG((TAG, "%s Notifying transmission task that new data is available\n", __func__));
         xTaskNotifyGiveIndexed(transmitTaskHandle, dataReadyNotifyIndex);
 
-        backgroundPacket->seqnum = activePacket->seqnum + 1;
         backgroundPacket->checksum = 0;
         backgroundPacket->payloadSize = 0;
         backgroundPacket->payloadStart = 0;;
     }
 
+    // We should never reach here. The sampling task should run forever.
     ESP_LOGE(TAG, "%s Terminating sampling task", __func__);
     vTaskDelete(NULL);
 }
@@ -528,14 +518,10 @@ void create_socket(bool* error, int* sock, struct sockaddr_in* dest_addr)
 
     // Set timeout for receiving echoes from server
     struct timeval timeout;
-    timeout.tv_sec = 0;
-    timeout.tv_usec = 20000;   // 20ms
+    timeout.tv_sec = 1;
+    timeout.tv_usec = 0;
     setsockopt(*sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
     
-    // TODO: See if this helps xmit time at all
-    // bool dont_route = 1;
-    // setsockopt(sock, SOL_SOCKET, SO_DONTROUTE, &dont_route, sizeof(dont_route));
-
     ESP_LOGI(TAG, "Socket created, sending to %s:%d", HOST_IP_ADDR, PORT);
     *error = false;
 }
@@ -613,15 +599,15 @@ void stream_audio_to_server(bool* error, const int sock, const struct sockaddr_i
         // CRC, timestamp, and transmit the audio packet
         activePacket->checksum = crc16(activePacket->payload, activePacket->payloadSize);
         activePacket->echo = !(activePacket->seqnum % 500);      // request an echo from the server 
-        uint32_t packetSize = sizeof(AudioPacket_t) - (PAYLOAD_MAX_LEN - activePacket->payloadSize);
+        uint32_t packetSize = sizeof(AudioPacket_t);
 
         get_system_time(&timesent);
 
-        PRINTF_DEBUG((TAG, "%s Sending packet with seqnum %u, payload len %u, CRC 0x%x to server.\n",
-            __func__, activePacket->seqnum, activePacket->payloadSize, activePacket->checksum));
-
         for (int i = 0; i < MAX_SEND_ATTEMPTS; i++)
         {
+            PRINTF_DEBUG((TAG, "%s Sending packet with seqnum %u, payload len %u, CRC 0x%x to server. Total size = %lu\n",
+                __func__, activePacket->seqnum, activePacket->payloadSize, activePacket->checksum, packetSize));
+
             int err = sendto(sock, activePacket, packetSize, 0, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
 
             if (err < 0) {
@@ -635,7 +621,7 @@ void stream_audio_to_server(bool* error, const int sock, const struct sockaddr_i
 
                 ESP_LOGE(TAG, "%s Error sending packet %u: errno %u (%s)", __func__, activePacket->seqnum, errno, strerror(errno));
 
-                // TODO: Check connection with server and exit if we are disconnected
+                // Check connection with server and exit if we are disconnected
                 wifi_ap_record_t ap;
                 if (esp_wifi_sta_get_ap_info(&ap) == ESP_ERR_WIFI_NOT_CONNECT)
                 {
@@ -643,7 +629,10 @@ void stream_audio_to_server(bool* error, const int sock, const struct sockaddr_i
                     return;
                 }
             }
-
+            else
+            {
+                break;
+            }
         }
 
         // Update packet statistics
@@ -658,10 +647,12 @@ void stream_audio_to_server(bool* error, const int sock, const struct sockaddr_i
             socklen_t socklen = sizeof(source_addr);
             int len = recvfrom(sock, &response, sizeof(response), 0, (struct sockaddr *)&source_addr, &socklen);
 
-            if (len < 0) {
+            if (len < 0) 
+            {
                 ESP_LOGE(TAG, "%s Failed to receive echo'd packet %u from server (errno = %s)", __func__, activePacket->seqnum, strerror(errno));
             }
-            else {
+            else 
+            {
                 get_system_time(&timerecv);
                 ESP_LOGI(TAG, "%s Received %d bytes. Seqnum = %u, payload size = %u\n", __func__, len, response.seqnum, response.payloadSize);
                 ESP_LOGI(TAG, "%s Round trip time: %lld\n", __func__, timerecv - timesent);
@@ -679,7 +670,6 @@ void stream_audio_to_server(bool* error, const int sock, const struct sockaddr_i
             packetsSinceLastEcho = 0;
         }
     }
-
 }
 
 
