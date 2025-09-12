@@ -25,6 +25,7 @@
 
 #include "esp_sntp.h"
 #include "esp_netif_sntp.h"
+#include "esp_task_wdt.h"
 
 #include "lwip/err.h"
 #include "lwip/sockets.h"
@@ -60,7 +61,7 @@
 #define ESP_CORE_0  0           // physical core 0
 #define ESP_CORE_1  1           // physical core 1
 
-#define AUDIO_PACKET_MAX_SAMPLES 250        // maximum number of audio samples we can receive from client at a time 
+#define AUDIO_PACKET_MAX_SAMPLES 250        // maximum number of audio samples we can send to server at a time 
 #define AUDIO_PACKET_BYTES_PER_SAMPLE 3     // size of each sample within an audio packet in bytes
 #define MAX_SEND_ATTEMPTS 3                 // maximum attempts to send a single audio packet
 
@@ -101,6 +102,14 @@ typedef struct SamplingTaskConfig_t
     bool useExternalAdc;
 } SamplingTaskConfig_t;
 
+static SamplingTaskConfig_t samplingTaskConfig =
+{
+    .sampleRate = 48000,
+    .useExternalAdc = true
+};
+
+static QueueHandle_t dmaBufferOverflowQueue;
+
 /* FreeRTOS event group to signal when we are connected*/
 static EventGroupHandle_t s_wifi_event_group;
 
@@ -117,9 +126,6 @@ static AudioPacket_t * backgroundPacket; // sampling task fills this packet
 static const UBaseType_t transmissionDoneNotifyIndex = 0;      // set by the transmission thread when it is done transmitting data
 static const UBaseType_t dataReadyNotifyIndex;                 // set by the sampling thread when there is new data to transmit
 
-static TaskHandle_t samplingTaskHandle = NULL;
-static TaskHandle_t transmitTaskHandle = NULL;
-
 #define PCM4201_BYTES_PER_SAMPLE 8
 typedef struct ExternalAdcCircularBuffer_t
 {
@@ -130,37 +136,10 @@ typedef struct ExternalAdcCircularBuffer_t
 
 static ExternalAdcCircularBuffer_t adcBuffer;
 
-////////////////////////////////////////////////////////////////////
-// crc16()
-//
-// Compute a crc16 using polynomial 0x1021 and seed value 0xFFFF
-// (see https://en.wikipedia.org/wiki/Cyclic_redundancy_check)
-////////////////////////////////////////////////////////////////////
-uint16_t crc16(uint8_t* data, uint32_t len)
-{
-    const uint16_t seed       = 0xFFFF;
-    const uint16_t polynomial = 0x1021;
-
-    uint16_t crc = seed;
-
-    for (int i = 0; i < len; i++)
-    {
-        uint8_t byte = data[i];
-
-        for (int j = 0; j < 8; j++)
-        {
-            if ((byte & 0x80) != 0)
-            {
-                crc ^= (polynomial << 8);
-            }
-
-            crc = (crc << 1) & 0xFFFF;
-            byte <<= 1;
-        }
-    }
-
-    return crc;
-}
+static TaskHandle_t samplingTaskHandle = NULL;                  // FIXME: If these task handles are declared
+static TaskHandle_t transmitTaskHandle = NULL;                  // before the adcBuffer, we get memory corruption in the BSS
+                                                                // segment. There is some kind of buffer overflow in
+                                                                // i2sChannelRead()
 
 
 ////////////////////////////////////////////////////////////////////
@@ -379,6 +358,25 @@ static bool IRAM_ATTR timer_isr_handler(gptimer_handle_t timer, const gptimer_al
 
 
 ////////////////////////////////////////////////////////////////////
+// i2s_rx_queue_overflow_callback 
+//
+// Reports whether the I2S DMA ring buffer overflowed
+////////////////////////////////////////////////////////////////////
+static IRAM_ATTR bool i2s_rx_queue_overflow_callback(i2s_chan_handle_t handle, i2s_event_data_t *event, void *user_ctx)
+{
+    // handle RX queue overflow event ...
+    if (pdTRUE == xQueueIsQueueEmptyFromISR(dmaBufferOverflowQueue))
+    {
+        size_t dmaBufferSize;
+        xQueueReceiveFromISR(dmaBufferOverflowQueue, &dmaBufferSize, NULL);
+    }
+
+    xQueueSendFromISR(dmaBufferOverflowQueue, &event->size, NULL);
+    return false;
+}
+
+
+////////////////////////////////////////////////////////////////////
 // setup_external_dac 
 //
 // Initialize the PCM4201 analog-to-digital converter
@@ -418,7 +416,7 @@ esp_err_t setup_external_adc(i2s_chan_handle_t* i2sHandle, const uint32_t sample
     i2s_chan_config_t i2sChanConfig = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_AUTO, I2S_ROLE_MASTER);
 
     ESP_ERROR_CHECK(i2s_new_channel(&i2sChanConfig, NULL, i2sHandle));
-    ESP_LOGI(__func__, "sample rate: %lu\n", sampleRate);
+
     i2s_std_config_t i2sStdConfig = 
     {
        .clk_cfg = 
@@ -456,10 +454,17 @@ esp_err_t setup_external_adc(i2s_chan_handle_t* i2sHandle, const uint32_t sample
     };
 
     ESP_ERROR_CHECK(i2s_channel_init_std_mode(*i2sHandle, &i2sStdConfig));
-    ESP_ERROR_CHECK(i2s_channel_enable(*i2sHandle));
-    
-    // The I2S receiver is now running and receiving data from the PCM4201
 
+    // Register an event callback that fires when the I2S RX DMA buffer
+    // overflows. This generally should not happen and indicates
+    // that we are not reading from I2S fast enough.
+    i2s_event_callbacks_t cbs = {
+        .on_recv = NULL,
+        .on_recv_q_ovf = i2s_rx_queue_overflow_callback,
+        .on_sent = NULL,
+        .on_send_q_ovf = NULL,
+    };
+    ESP_ERROR_CHECK(i2s_channel_register_event_callback(*i2sHandle, &cbs, NULL));
     return ESP_OK;
 }
 
@@ -571,11 +576,13 @@ esp_err_t external_adc_collect_samples(i2s_chan_handle_t* i2sHandle)
     // Keep sampling until both of the following is true 
     //    a) the transmit task is done sending the active packet
     //    b) we've collected sufficient data to send in a packet
-    size_t min_samples_required = AUDIO_PACKET_MAX_SAMPLES / 5;
+    size_t min_samples_required = AUDIO_PACKET_MAX_SAMPLES >> 1;
     size_t min_bytes_required = min_samples_required * PCM4201_BYTES_PER_SAMPLE;
 
-    uint s = 0;
-    while ((adcBuffer.size < min_bytes_required) || !ulTaskNotifyTakeIndexed(transmissionDoneNotifyIndex, pdTRUE, portMAX_DELAY))
+    uint16_t s = 0; 
+    int64_t start = 0, stop = 0;
+
+    while ((adcBuffer.size <= min_bytes_required) || !ulTaskNotifyTakeIndexed(transmissionDoneNotifyIndex, pdTRUE, 0))
     {
 
         // Since we are repeatedly reading data into the ADC buffer,
@@ -595,16 +602,36 @@ esp_err_t external_adc_collect_samples(i2s_chan_handle_t* i2sHandle)
         // Compute where to write new data
         uint write_pos = (adcBuffer.start + adcBuffer.size) % ADC_BUFFER_CAPACITY;
 
-        esp_err_t ret = i2s_channel_read(*i2sHandle, &adcBuffer.buffer[write_pos], BYTES_PER_CHUNK, NULL, 1);
-        for (int i = 0; i < SAMPLES_PER_CHUNK; i++)
+        size_t bytesRead = 0, totalBytesRead = 0;
+        esp_err_t ret = ESP_OK;
+
+        get_system_time(&start);
+        do
         {
-            ret = ESP_OK;
-            for (int j = 0; j < AUDIO_PACKET_BYTES_PER_SAMPLE; j++)
-            {
-                adcBuffer.buffer[write_pos + i * PCM4201_BYTES_PER_SAMPLE + 1 + j] = s;
-            }
-            s++;
+            // uint8_t wr_start = adcBuffer.buffer + write_pos + totalBytesRead;
+            uint8_t timeout_ms = 50;
+            ret = i2s_channel_read(*i2sHandle, &adcBuffer.buffer[write_pos + totalBytesRead], BYTES_PER_CHUNK, &bytesRead, timeout_ms, &samplingTaskHandle);
+            totalBytesRead += bytesRead;
+        } while (ret == ESP_OK && totalBytesRead < BYTES_PER_CHUNK);
+        
+        if (ret != ESP_OK || bytesRead != BYTES_PER_CHUNK)
+        {
+            ESP_LOGE(__func__, "Error during I2S read: (%u) %s (%u bytes read in %f sec)!\n",
+                ret, esp_err_to_name(ret), bytesRead, (stop - start) / 1e6);
         }
+
+        //// UNCOMMENT ME to sample artificial data
+        // for (int i = 0; i < SAMPLES_PER_CHUNK; i++)
+        // {
+        //     ret = ESP_OK;
+        //     for (int j = 0; j < AUDIO_PACKET_BYTES_PER_SAMPLE; j++)
+        //     {
+        //         adcBuffer.buffer[write_pos + i * PCM4201_BYTES_PER_SAMPLE + 1 + j] = s;
+        //     }
+        //     s = (s + 1) & 0xFF;
+        // }
+        
+        // esp_rom_delay_us((uint32_t)(1.0f * SAMPLES_PER_CHUNK * 1000 * 1000 / 48000));
 
         if (ret != ESP_OK)
         {
@@ -625,11 +652,6 @@ esp_err_t external_adc_collect_samples(i2s_chan_handle_t* i2sHandle)
 
     uint32_t adcBufferNumSamples = adcBuffer.size / PCM4201_BYTES_PER_SAMPLE;
 
-    // for (int i = 0; i < adcBuffer.size; i++)
-    // {
-    //     ESP_LOGI(__func__, "[%u] = %x", i, adcBuffer.buffer[i]);
-    // }
-
     for (int i = 0; i < adcBufferNumSamples; i++)
     {
         int sampleStart = (adcBuffer.start + i * PCM4201_BYTES_PER_SAMPLE) % ADC_BUFFER_CAPACITY;
@@ -645,54 +667,59 @@ esp_err_t external_adc_collect_samples(i2s_chan_handle_t* i2sHandle)
 
     backgroundPacket->payloadStart = 0;
 
-    // for (int i = 0; i < backgroundPacket->numSamples; i++)
-    // {
-    //     ESP_LOGI(__func__, "[%u]: %2x%2x%2x", i,
-    //         backgroundPacket->payload[i * AUDIO_PACKET_BYTES_PER_SAMPLE],
-    //         backgroundPacket->payload[i * AUDIO_PACKET_BYTES_PER_SAMPLE+1],
-    //         backgroundPacket->payload[i * AUDIO_PACKET_BYTES_PER_SAMPLE+2]);
-    // }
     return ESP_OK;
 }
 
 ////////////////////////////////////////////////////////////////////
-// sampling_task 
+// sampling_task_main
 //
 // Main event loop for sampling audio data
 ////////////////////////////////////////////////////////////////////
-static void sampling_task(void* pvParameters)
+static void sampling_task_main(void* pvParameters)
 {
     SamplingTaskConfig_t* config = (SamplingTaskConfig_t*)pvParameters;
-    ESP_LOGI(__func__, "[1] sampleRate: %lu\n", config->sampleRate);
+
+    // Sign up for the task watchdog. This will be useful for knowing whether this
+    // task is blocked for extended periods without us knowing about it.
+    esp_task_wdt_add(xTaskGetCurrentTaskHandle());
+
     // Wait for the transmit task to come up
-    // while (transmitTaskHandle == NULL)
-    // {
-    //     ESP_LOGI(TAG, "%s: Waiting for transmit task to be created...\n", __func__);
-    //     vTaskDelay(500 / portTICK_PERIOD_MS);
-    // }
+    while (transmitTaskHandle == NULL)
+    {
+        ESP_LOGI(TAG, "%s: Waiting for transmit task to be created...\n", __func__);
+        vTaskDelay(500 / portTICK_PERIOD_MS);
+        break;
+    }
 
     // Set up the internal or external ADC
     gptimer_handle_t gpTimerHandle = NULL;
     i2s_chan_handle_t i2sHandle    = NULL;
     if (config->useExternalAdc)
     {
-        ESP_LOGI(__func__, "[2] sampleRate: %lu\n", config->sampleRate);
         ESP_ERROR_CHECK(setup_external_adc(&i2sHandle, config->sampleRate));
         assert(i2sHandle);
+
+        // Set up DMA buffer overflow callback
+        dmaBufferOverflowQueue = xQueueCreate(5, sizeof(size_t));
+        assert(dmaBufferOverflowQueue);
+
+        // Start the i2s receiver
+        ESP_ERROR_CHECK(i2s_channel_enable(i2sHandle));
     }
     else
     {
         ESP_ERROR_CHECK(setup_esp32_adc(&gpTimerHandle, config->sampleRate));
         assert(gpTimerHandle);
-
-        // adcBuffer = malloc(sizeof(ExternalAdcCircularBuffer_t));
-        // assert(adcBuffer);
     }
 
     // In an infinite loop, collect samples from ADC and transfer them to the transmit task  
     while (true)
     {
 
+        // Kick the watchdog timer
+        ESP_ERROR_CHECK_WITHOUT_ABORT(esp_task_wdt_reset());
+
+        // Collect samples
         if (config->useExternalAdc)
         {
             ESP_ERROR_CHECK(external_adc_collect_samples(&i2sHandle));
@@ -710,12 +737,20 @@ static void sampling_task(void* pvParameters)
         backgroundPacket = tmp;
         backgroundPacket->seqnum = activePacket->seqnum + 1;
 
-        PRINTF_DEBUG((TAG, "%s Notifying transmission task that new data is available\n", __func__));
+        PRINTF_DEBUG((__func__, "Notifying transmission task that new data is available (%u)\n",
+            activePacket->numSamples));
         xTaskNotifyGiveIndexed(transmitTaskHandle, dataReadyNotifyIndex);
 
         backgroundPacket->checksum = 0;
         backgroundPacket->numSamples = 0;
-        backgroundPacket->payloadStart = 0;;
+        backgroundPacket->payloadStart = 0;
+
+        // Check if the I2S DMA buffer overflowed (diagnostic)
+        if (uxQueueMessagesWaiting(dmaBufferOverflowQueue))
+        {
+            // ESP_LOGE(__func__, "I2S DMA buffer overflowed!\n");
+            xQueueReset(dmaBufferOverflowQueue);
+        }
     }
 
     // We should never reach here. The sampling task should run forever.
@@ -837,18 +872,33 @@ void stream_audio_to_server(bool* error, const int sock, const struct sockaddr_i
     get_system_time(&timeOfLastEcho);
 
     // Stream audio data to server
+    int64_t prevTime, currTime, timenow;
+    get_system_time(&prevTime);
+
+    int numLoops = 0;
+    int64_t loopTime = 0;
     while (1) {
 
-        // Indicate to sampling thread that there is no data to transmit
-        PRINTF_DEBUG((TAG, "%s Notifying of transmission done.\n", __func__));
-        xTaskNotifyGiveIndexed(samplingTaskHandle, transmissionDoneNotifyIndex);
+        // Kick the watchdog timer
+        ESP_ERROR_CHECK_WITHOUT_ABORT(esp_task_wdt_reset());
 
-        int64_t timenow;
-        get_system_time(&timenow);
+        // Indicate to sampling thread that there is no data to transmit
+        esp_rom_delay_us(3 * 1000);
+        // prevTime = currTime;
+        // get_system_time(&currTime);
+        // numLoops++;
+        // loopTime += (currTime - prevTime);
+
+        // if (numLoops == 50)
+        // {
+        //     ESP_LOGI(__func__, "Avg loop time: %llu\n", loopTime / numLoops);
+        //     numLoops = 0;
+        //     loopTime = 0;
+        // }
+        xTaskNotifyGiveIndexed(samplingTaskHandle, transmissionDoneNotifyIndex);
 
         // Wait for the sampling task to indicate that there is new data available
         // (Ideally, this should not block at all because we just blocked earlier)
-        PRINTF_DEBUG((TAG, "%s Waiting for data ready.\n", __func__));
         if(ulTaskNotifyTakeIndexed(dataReadyNotifyIndex, pdTRUE, pdMS_TO_TICKS(1000)))
         {
             PRINTF_DEBUG((TAG, "%s Got data ready notification.\n", __func__));
@@ -859,8 +909,7 @@ void stream_audio_to_server(bool* error, const int sock, const struct sockaddr_i
             continue;
         }
 
-        // CRC, timestamp, and transmit the audio packet
-        activePacket->checksum = crc16(activePacket->payload, activePacket->numSamples * AUDIO_PACKET_BYTES_PER_SAMPLE);
+        // Timestamp and transmit the audio packet
     
         activePacket->echo = !(activePacket->seqnum % 500);      // request an echo from the server 
         uint32_t packetSize = sizeof(AudioPacket_t);
@@ -873,7 +922,8 @@ void stream_audio_to_server(bool* error, const int sock, const struct sockaddr_i
                 __func__, activePacket->seqnum, activePacket->payloadSize, activePacket->checksum, packetSize));
 
             int err = sendto(sock, activePacket, packetSize, 0, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
-
+            // get_system_time(&timenow);
+            // ESP_LOGI(__func__, "Sent (%llu)\n", timenow - timesent);
             if (err < 0) {
                 if (errno == ENOMEM)
                 {
@@ -921,7 +971,7 @@ void stream_audio_to_server(bool* error, const int sock, const struct sockaddr_i
             {
                 get_system_time(&timerecv);
                 ESP_LOGI(TAG, "%s Received %d bytes. Seqnum = %u, payload size = %u\n", __func__, len, response.seqnum, response.numSamples);
-                ESP_LOGI(TAG, "%s Round trip time: %lld\n", __func__, timerecv - timesent);
+                ESP_LOGI(TAG, "%s Round trip time: %lld usec\n", __func__, timerecv - timesent);
             }
 
             // Report transmit statistics
@@ -940,17 +990,24 @@ void stream_audio_to_server(bool* error, const int sock, const struct sockaddr_i
 
 
 ////////////////////////////////////////////////////////////////////
-// transmit_task 
+// transmit_task_main
 //
 // Main event loop for streaming data to server.
 ////////////////////////////////////////////////////////////////////
-static void transmit_task(void *pvParameters)
+static void transmit_task_main(void *pvParameters)
 {
+
+    // Sign up for the task watchdog. This will be useful for knowing whether this
+    // task is blocked for extended periods without us knowing about it.
+    esp_task_wdt_add(xTaskGetCurrentTaskHandle());
 
     transmitTaskState = XMIT_TASK_STATE_CONNECT_TO_NETWORK;
 
+    while (1) 
+    {
 
-    while (1) {
+        // Kick the watchdog timer
+        ESP_ERROR_CHECK_WITHOUT_ABORT(esp_task_wdt_reset());
 
         bool error;
         static int socket = -1;
@@ -1077,22 +1134,15 @@ void app_main(void)
     //
     ESP_LOGI(TAG, "%s Creating tasks\n", __func__); 
     BaseType_t status;
-   
-    SamplingTaskConfig_t samplingTaskConfig =
-    {
-        .sampleRate = 48000,
-        .useExternalAdc = true
-    };
-
-    status = xTaskCreatePinnedToCore(sampling_task, "sampling_task", 8192, (void*)&samplingTaskConfig, 5, &samplingTaskHandle, ESP_CORE_0);
+    status = xTaskCreatePinnedToCore(sampling_task_main, "sampling_task", 8192, (void*)&samplingTaskConfig, 5, &samplingTaskHandle, ESP_CORE_0);
 
     if (status != pdPASS)
     {
         ESP_LOGE(TAG, "%s Failed to create sampling task!\n", __func__);
         return;
     }
-    
-    status = xTaskCreatePinnedToCore(transmit_task, "transmit_task", 8192, NULL, 5, &transmitTaskHandle, ESP_CORE_1);
+
+    status = xTaskCreatePinnedToCore(transmit_task_main, "transmit_task", 8192, NULL, 5, &transmitTaskHandle, ESP_CORE_1);
 
     if (status != pdPASS)
     {
