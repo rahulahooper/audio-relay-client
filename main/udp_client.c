@@ -61,7 +61,7 @@
 #define ESP_CORE_0  0           // physical core 0
 #define ESP_CORE_1  1           // physical core 1
 
-#define AUDIO_PACKET_MAX_SAMPLES 250        // maximum number of audio samples we can send to server at a time 
+#define AUDIO_PACKET_MAX_SAMPLES 300        // maximum number of audio samples we can send to server at a time 
 #define AUDIO_PACKET_BYTES_PER_SAMPLE 3     // size of each sample within an audio packet in bytes
 #define MAX_SEND_ATTEMPTS 3                 // maximum attempts to send a single audio packet
 
@@ -576,11 +576,13 @@ esp_err_t external_adc_collect_samples(i2s_chan_handle_t* i2sHandle)
     // Keep sampling until both of the following is true 
     //    a) the transmit task is done sending the active packet
     //    b) we've collected sufficient data to send in a packet
-    size_t min_samples_required = AUDIO_PACKET_MAX_SAMPLES >> 1;
+    size_t min_samples_required = AUDIO_PACKET_MAX_SAMPLES * 2 / 5;
     size_t min_bytes_required = min_samples_required * PCM4201_BYTES_PER_SAMPLE;
 
     uint16_t s = 0; 
     int64_t start = 0, stop = 0;
+
+    uint16_t overflow = 0;
 
     while ((adcBuffer.size <= min_bytes_required) || !ulTaskNotifyTakeIndexed(transmissionDoneNotifyIndex, pdTRUE, 0))
     {
@@ -594,7 +596,7 @@ esp_err_t external_adc_collect_samples(i2s_chan_handle_t* i2sHandle)
         // Overflow check: drop the oldest chunk if necessary
         if (adcBuffer.size + BYTES_PER_CHUNK > ADC_BUFFER_CAPACITY)
         {
-            uint overflow = adcBuffer.size + BYTES_PER_CHUNK - ADC_BUFFER_CAPACITY;
+            overflow = adcBuffer.size + BYTES_PER_CHUNK - ADC_BUFFER_CAPACITY;
             adcBuffer.start = (adcBuffer.start + overflow) % ADC_BUFFER_CAPACITY;
             adcBuffer.size -= overflow;
         }
@@ -608,7 +610,6 @@ esp_err_t external_adc_collect_samples(i2s_chan_handle_t* i2sHandle)
         get_system_time(&start);
         do
         {
-            // uint8_t wr_start = adcBuffer.buffer + write_pos + totalBytesRead;
             uint8_t timeout_ms = 50;
             ret = i2s_channel_read(*i2sHandle, &adcBuffer.buffer[write_pos + totalBytesRead], BYTES_PER_CHUNK, &bytesRead, timeout_ms, &samplingTaskHandle);
             totalBytesRead += bytesRead;
@@ -649,6 +650,12 @@ esp_err_t external_adc_collect_samples(i2s_chan_handle_t* i2sHandle)
     // 3 bytes of real data and 5 dummy bytes. When transferring
     // samples from the ADC buffer to the background packet, strip
     // off the dummy bytes.
+
+    if (overflow > 0)
+    {
+        ESP_LOGI(__func__, "Overflow of %u bytes occurred on sampling task\n", overflow);
+        overflow = 0;
+    }
 
     uint32_t adcBufferNumSamples = adcBuffer.size / PCM4201_BYTES_PER_SAMPLE;
 
@@ -884,17 +891,6 @@ void stream_audio_to_server(bool* error, const int sock, const struct sockaddr_i
 
         // Indicate to sampling thread that there is no data to transmit
         esp_rom_delay_us(3 * 1000);
-        // prevTime = currTime;
-        // get_system_time(&currTime);
-        // numLoops++;
-        // loopTime += (currTime - prevTime);
-
-        // if (numLoops == 50)
-        // {
-        //     ESP_LOGI(__func__, "Avg loop time: %llu\n", loopTime / numLoops);
-        //     numLoops = 0;
-        //     loopTime = 0;
-        // }
         xTaskNotifyGiveIndexed(samplingTaskHandle, transmissionDoneNotifyIndex);
 
         // Wait for the sampling task to indicate that there is new data available
