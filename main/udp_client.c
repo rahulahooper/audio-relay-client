@@ -34,6 +34,8 @@
 
 #include "driver/gptimer.h"
 
+#include "example_audio_file.h"
+
 // -------- Local definitions and macros -------- //
 
 #ifdef CONFIG_EXAMPLE_SOCKET_IP_INPUT_STDIN
@@ -87,6 +89,8 @@ typedef struct AudioPacket_t
 
 typedef enum TransmitTaskState_t
 {
+    XMIT_TASK_INITIAL_STATE,
+    XMIT_TASK_STATE_START_WIFI,
     XMIT_TASK_STATE_CONNECT_TO_NETWORK,
     XMIT_TASK_STATE_CREATE_SOCKET,
     XMIT_TASK_STATE_STREAM_TO_SERVER,
@@ -96,16 +100,23 @@ typedef enum TransmitTaskState_t
 
 static TransmitTaskState_t transmitTaskState;
 
+typedef enum SamplingTaskAudioSource_t
+{
+    AUDIO_SOURCE_EXTERNAL_ADC,
+    AUDIO_SOURCE_INTERNAL_ADC,
+    AUDIO_SOURCE_BUFFER,
+} SamplingTaskAudioSource_t;
+
 typedef struct SamplingTaskConfig_t
 {
     uint32_t sampleRate;
-    bool useExternalAdc;
+    SamplingTaskAudioSource_t audioSource;
 } SamplingTaskConfig_t;
 
 static SamplingTaskConfig_t samplingTaskConfig =
 {
-    .sampleRate = 48000,
-    .useExternalAdc = true
+    .sampleRate  = 48000,
+    .audioSource = AUDIO_SOURCE_BUFFER,
 };
 
 static QueueHandle_t dmaBufferOverflowQueue;
@@ -114,7 +125,8 @@ static QueueHandle_t dmaBufferOverflowQueue;
 static EventGroupHandle_t s_wifi_event_group;
 
 // Set this bit when we connect to a Wifi network
-#define WIFI_CONNECTED_BIT BIT0
+#define WIFI_CONNECTED_BIT      BIT0
+#define WIFI_DISCONNECTED_BIT   BIT1
 
 static const char *TAG = "wifi station";
 static int gWifiConnectAttempts = 0;
@@ -139,7 +151,7 @@ static ExternalAdcCircularBuffer_t adcBuffer;
 static TaskHandle_t samplingTaskHandle = NULL;                  // FIXME: If these task handles are declared
 static TaskHandle_t transmitTaskHandle = NULL;                  // before the adcBuffer, we get memory corruption in the BSS
                                                                 // segment. There is some kind of buffer overflow in
-                                                                // i2sChannelRead()
+                                                                // i2s_channel_read()
 
 
 ////////////////////////////////////////////////////////////////////
@@ -171,7 +183,7 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
     else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         esp_wifi_connect();
         gWifiConnectAttempts++;
-        ESP_LOGI(TAG, "%s Failed to connect to the AP, retrying (attempt #%u)\n", __func__, gWifiConnectAttempts);
+        xEventGroupSetBits(s_wifi_event_group, WIFI_DISCONNECTED_BIT);
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
         ESP_LOGI(TAG, "got ip:" IPSTR, IP2STR(&event->ip_info.ip));
@@ -218,14 +230,31 @@ esp_err_t wifi_deinit_driver()
 }
 
 ////////////////////////////////////////////////////////////////////
-// wifi_station_start_and_connect()
+// _wifi_station_start()
 //
 ////////////////////////////////////////////////////////////////////
-void wifi_station_start_and_connect(wifi_config_t* wifi_config, bool* error)
+void _wifi_station_start(bool* error)
 {
-    *error = true;
+    ESP_LOGI(TAG, "%s: Connecting to Audio Relay Wifi Network\n", __func__);
+
+    wifi_config_t audio_wifi_config = {
+        .sta = {
+            .ssid = AUDIO_NET_WIFI_SSID,
+            .password = AUDIO_NET_WIFI_PASS,
+            /* Authmode threshold resets to WPA2 as default if password matches WPA2 standards (password len => 8).
+             * If you want to connect the device to deprecated WEP/WPA networks, Please set the threshold value
+             * to WIFI_AUTH_WEP/WIFI_AUTH_WPA_PSK and set the password with length and format matching to
+             * WIFI_AUTH_WEP/WIFI_AUTH_WPA_PSK standards.
+             */
+            .threshold.authmode = ESP_WIFI_SCAN_AUTH_MODE_THRESHOLD,
+            .sae_pwe_h2e = ESP_WIFI_SAE_MODE,
+            .sae_h2e_identifier = EXAMPLE_H2E_IDENTIFIER,
+        },
+    };
+
     esp_event_handler_instance_t instance_any_id;
     esp_event_handler_instance_t instance_got_ip;
+
     ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
                                                         ESP_EVENT_ANY_ID,
                                                         &wifi_event_handler,
@@ -238,33 +267,51 @@ void wifi_station_start_and_connect(wifi_config_t* wifi_config, bool* error)
                                                         &instance_got_ip));
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA) );
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, wifi_config) );
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &audio_wifi_config) );
     ESP_ERROR_CHECK(esp_wifi_start() );
 
     ESP_LOGI(TAG, "%s Started WiFi!\n", __func__);
+    *error = false;
+}
+
+
+////////////////////////////////////////////////////////////////////
+// wifi_station_connect()
+//
+////////////////////////////////////////////////////////////////////
+void wifi_station_connect(bool* error, bool* connected)
+{
+    ESP_LOGI(__func__, "Connecting to Wifi station\n");
+    *error = true;
 
     // Wait until either the connection is established (WIFI_CONNECTED_BIT) or 
     // connection failed after the maximum number of re-tries (WIFI_FAIL_BIT). 
     // The bits are set by wifi_event_handler() (see above)
-    xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+    xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_DISCONNECTED_BIT);
     EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
-            WIFI_CONNECTED_BIT,
+            WIFI_CONNECTED_BIT | WIFI_DISCONNECTED_BIT,
             pdFALSE,
             pdFALSE,
-            portMAX_DELAY);
+            pdMS_TO_TICKS(1000));
     
-    const char* ssid = (const char*)(wifi_config->sta.ssid);
-    const char* password = (const char*)(wifi_config->sta.password);
     if (bits & WIFI_CONNECTED_BIT) 
     {
-        ESP_LOGI(TAG, "%s: connected to ap SSID:%s password:%s",
-                __func__, ssid, password);
+        ESP_LOGI(TAG, "%s: connected to Wifi!\n", __func__);
+        *connected = true;
         *error = false;
     } 
+    else if (bits & WIFI_DISCONNECTED_BIT)
+    {
+        ESP_LOGI(TAG, "%s Failed to connect to the AP, retrying (attempt #%u)\n", __func__, gWifiConnectAttempts);
+        *connected = false;
+        *error = false;
+    }
     else 
     {
         ESP_LOGE(TAG, "%s: UNEXPECTED EVENT: %lx\n",
                 __func__, bits);
+        *connected = false;
+        *error = false;
     }
 }
 
@@ -579,13 +626,15 @@ esp_err_t external_adc_collect_samples(i2s_chan_handle_t* i2sHandle)
     size_t min_samples_required = AUDIO_PACKET_MAX_SAMPLES * 2 / 5;
     size_t min_bytes_required = min_samples_required * PCM4201_BYTES_PER_SAMPLE;
 
-    uint16_t s = 0; 
     int64_t start = 0, stop = 0;
 
     uint16_t overflow = 0;
 
     while ((adcBuffer.size <= min_bytes_required) || !ulTaskNotifyTakeIndexed(transmissionDoneNotifyIndex, pdTRUE, 0))
     {
+
+        // Kick the watchdog timer
+        ESP_ERROR_CHECK_WITHOUT_ABORT(esp_task_wdt_reset());
 
         // Since we are repeatedly reading data into the ADC buffer,
         // there is a chance the buffer will overflow. If an overflow
@@ -620,19 +669,6 @@ esp_err_t external_adc_collect_samples(i2s_chan_handle_t* i2sHandle)
             ESP_LOGE(__func__, "Error during I2S read: (%u) %s (%u bytes read in %f sec)!\n",
                 ret, esp_err_to_name(ret), bytesRead, (stop - start) / 1e6);
         }
-
-        //// UNCOMMENT ME to sample artificial data
-        // for (int i = 0; i < SAMPLES_PER_CHUNK; i++)
-        // {
-        //     ret = ESP_OK;
-        //     for (int j = 0; j < AUDIO_PACKET_BYTES_PER_SAMPLE; j++)
-        //     {
-        //         adcBuffer.buffer[write_pos + i * PCM4201_BYTES_PER_SAMPLE + 1 + j] = s;
-        //     }
-        //     s = (s + 1) & 0xFF;
-        // }
-        
-        // esp_rom_delay_us((uint32_t)(1.0f * SAMPLES_PER_CHUNK * 1000 * 1000 / 48000));
 
         if (ret != ESP_OK)
         {
@@ -677,6 +713,45 @@ esp_err_t external_adc_collect_samples(i2s_chan_handle_t* i2sHandle)
     return ESP_OK;
 }
 
+
+////////////////////////////////////////////////////////////////////
+// local_buffer_collect_samples()
+//
+////////////////////////////////////////////////////////////////////
+esp_err_t local_buffer_collect_samples()
+{
+
+    // We store a buffer containing precomputed audio samples at a particular frequency
+    // Store as many repetitions as possible of that buffer in the backgroundPacket
+    int32_t* localBuffer = audio_table_500hz;
+    const size_t localBufferNumSamples = audio_table_500hz_size;
+
+    const uint16_t numBuffersPerAudioPacket = (AUDIO_PACKET_MAX_SAMPLES) / localBufferNumSamples / 2;
+
+    for (int i = 0; i < numBuffersPerAudioPacket; i++)
+    {
+        uint16_t offset = i * localBufferNumSamples * AUDIO_PACKET_BYTES_PER_SAMPLE;
+
+        for (int j = 0; j < localBufferNumSamples; j++)
+        {
+            // remove the sign-extension bits from the sample
+            int32_t sample = (localBuffer[j] << 8) >> 8;    
+
+            // the sample is stored little-endian and we have zero'd out the sign extension bits
+            // store the remaining 3 bytes in the backgroundPacket.
+            memcpy(backgroundPacket->payload + offset + j * AUDIO_PACKET_BYTES_PER_SAMPLE, &sample, AUDIO_PACKET_BYTES_PER_SAMPLE);
+        }
+    }
+
+    backgroundPacket->payloadStart = 0;
+    backgroundPacket->numSamples = numBuffersPerAudioPacket * localBufferNumSamples;
+
+    while (!ulTaskNotifyTakeIndexed(transmissionDoneNotifyIndex, pdTRUE, 0));
+
+    return ESP_OK;
+}
+
+
 ////////////////////////////////////////////////////////////////////
 // sampling_task_main
 //
@@ -695,14 +770,15 @@ static void sampling_task_main(void* pvParameters)
     {
         ESP_LOGI(TAG, "%s: Waiting for transmit task to be created...\n", __func__);
         vTaskDelay(500 / portTICK_PERIOD_MS);
-        break;
     }
 
     // Set up the internal or external ADC
     gptimer_handle_t gpTimerHandle = NULL;
     i2s_chan_handle_t i2sHandle    = NULL;
-    if (config->useExternalAdc)
+    if (config->audioSource == AUDIO_SOURCE_EXTERNAL_ADC)
     {
+        ESP_LOGI(__func__, "Using external adc for audio samples\n");
+
         ESP_ERROR_CHECK(setup_external_adc(&i2sHandle, config->sampleRate));
         assert(i2sHandle);
 
@@ -713,10 +789,15 @@ static void sampling_task_main(void* pvParameters)
         // Start the i2s receiver
         ESP_ERROR_CHECK(i2s_channel_enable(i2sHandle));
     }
-    else
+    else if (config->audioSource == AUDIO_SOURCE_INTERNAL_ADC)
     {
+        ESP_LOGI(__func__, "Using internal esp32 adc for audio samples\n");
         ESP_ERROR_CHECK(setup_esp32_adc(&gpTimerHandle, config->sampleRate));
         assert(gpTimerHandle);
+    }
+    else    // AUDIO_SOURCE_BUFFER
+    {
+        ESP_LOGI(__func__, "Using local buffer for audio samples\n");
     }
 
     // In an infinite loop, collect samples from ADC and transfer them to the transmit task  
@@ -727,13 +808,17 @@ static void sampling_task_main(void* pvParameters)
         ESP_ERROR_CHECK_WITHOUT_ABORT(esp_task_wdt_reset());
 
         // Collect samples
-        if (config->useExternalAdc)
+        if (config->audioSource == AUDIO_SOURCE_EXTERNAL_ADC)
         {
             ESP_ERROR_CHECK(external_adc_collect_samples(&i2sHandle));
         }
-        else
+        else if (config->audioSource == AUDIO_SOURCE_INTERNAL_ADC)
         {
             ESP_ERROR_CHECK(esp32_adc_collect_samples(&gpTimerHandle));
+        }
+        else    // AUDIO_SOURCE_BUFFER
+        {
+            ESP_ERROR_CHECK(local_buffer_collect_samples());
         }
 
         // At this point, the transmit thread is waiting for a data ready signal and is
@@ -753,7 +838,7 @@ static void sampling_task_main(void* pvParameters)
         backgroundPacket->payloadStart = 0;
 
         // Check if the I2S DMA buffer overflowed (diagnostic)
-        if (uxQueueMessagesWaiting(dmaBufferOverflowQueue))
+        if (dmaBufferOverflowQueue && uxQueueMessagesWaiting(dmaBufferOverflowQueue))
         {
             // ESP_LOGE(__func__, "I2S DMA buffer overflowed!\n");
             xQueueReset(dmaBufferOverflowQueue);
@@ -765,33 +850,6 @@ static void sampling_task_main(void* pvParameters)
     vTaskDelete(NULL);
 }
 
-
-////////////////////////////////////////////////////////////////////
-// relay_network_connect 
-//
-// Connect to the Audio Relay Network server
-////////////////////////////////////////////////////////////////////
-void relay_network_connect(bool * error)
-{
-    ESP_LOGI(TAG, "%s: Connecting to Audio Relay Wifi Network\n", __func__);
-
-    wifi_config_t audio_wifi_config = {
-        .sta = {
-            .ssid = AUDIO_NET_WIFI_SSID,
-            .password = AUDIO_NET_WIFI_PASS,
-            /* Authmode threshold resets to WPA2 as default if password matches WPA2 standards (password len => 8).
-             * If you want to connect the device to deprecated WEP/WPA networks, Please set the threshold value
-             * to WIFI_AUTH_WEP/WIFI_AUTH_WPA_PSK and set the password with length and format matching to
-             * WIFI_AUTH_WEP/WIFI_AUTH_WPA_PSK standards.
-             */
-            .threshold.authmode = ESP_WIFI_SCAN_AUTH_MODE_THRESHOLD,
-            .sae_pwe_h2e = ESP_WIFI_SAE_MODE,
-            .sae_h2e_identifier = EXAMPLE_H2E_IDENTIFIER,
-        },
-    };
-
-    wifi_station_start_and_connect(&audio_wifi_config, error);
-}
 
 ////////////////////////////////////////////////////////////////////
 // create_socket() 
@@ -907,7 +965,7 @@ void stream_audio_to_server(bool* error, const int sock, const struct sockaddr_i
 
         // Timestamp and transmit the audio packet
     
-        activePacket->echo = !(activePacket->seqnum % 500);      // request an echo from the server 
+        activePacket->echo = false; //  !(activePacket->seqnum % 500);      // request an echo from the server 
         uint32_t packetSize = sizeof(AudioPacket_t);
 
         get_system_time(&timesent);
@@ -974,7 +1032,7 @@ void stream_audio_to_server(bool* error, const int sock, const struct sockaddr_i
             uint32_t avgPacketSize = bytesSinceLastEcho / packetsSinceLastEcho;
             float avgThroughput = 1.0f * bytesSinceLastEcho / (timerecv - timeOfLastEcho) * 1000 * 1000;
 
-            ESP_LOGI(TAG, "%s Average packet size = %lu, average throughput (bytes/sec) = %f\n", 
+            ESP_LOGI(__func__, "%s average packet size = %lu, average throughput (bytes/sec) = %f\n", 
                 __func__, avgPacketSize, avgThroughput);
 
             timeOfLastEcho = timerecv;
@@ -997,7 +1055,7 @@ static void transmit_task_main(void *pvParameters)
     // task is blocked for extended periods without us knowing about it.
     esp_task_wdt_add(xTaskGetCurrentTaskHandle());
 
-    transmitTaskState = XMIT_TASK_STATE_CONNECT_TO_NETWORK;
+    transmitTaskState = XMIT_TASK_INITIAL_STATE;
 
     while (1) 
     {
@@ -1011,9 +1069,10 @@ static void transmit_task_main(void *pvParameters)
 
         switch (transmitTaskState)
         {
-            case XMIT_TASK_STATE_CONNECT_TO_NETWORK:
+            case XMIT_TASK_INITIAL_STATE:
+            case XMIT_TASK_STATE_START_WIFI:
             {
-                relay_network_connect(&error);
+                _wifi_station_start(&error);
 
                 if (error)
                 {
@@ -1023,8 +1082,24 @@ static void transmit_task_main(void *pvParameters)
                 }
                 else
                 {
-                    transmitTaskState = XMIT_TASK_STATE_CREATE_SOCKET;
+                    transmitTaskState = XMIT_TASK_STATE_CONNECT_TO_NETWORK;
                 }
+                break;
+            }
+            case XMIT_TASK_STATE_CONNECT_TO_NETWORK:
+            {
+                bool connected = false;
+                wifi_station_connect(&error, &connected);
+
+                if (error)
+                {
+                    ESP_LOGI(__func__, "Error connecting to network!\n");
+                    transmitTaskState = XMIT_TASK_STATE_NETWORK_DISCONNECT;
+                }
+                else if (connected)
+                {
+                    transmitTaskState = XMIT_TASK_STATE_CREATE_SOCKET;
+                }    
                 break;
             }
             case XMIT_TASK_STATE_CREATE_SOCKET:
@@ -1067,7 +1142,7 @@ static void transmit_task_main(void *pvParameters)
             case XMIT_TASK_STATE_NETWORK_DISCONNECT:
             {
                 wifi_station_disconnect_and_stop(&error);
-                transmitTaskState = XMIT_TASK_STATE_CONNECT_TO_NETWORK;
+                transmitTaskState = XMIT_TASK_INITIAL_STATE;
                 break;
             }
             default:
