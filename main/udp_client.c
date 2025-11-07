@@ -35,6 +35,7 @@
 #include "driver/gptimer.h"
 
 #include "example_audio_file.h"
+#include "util.h"
 
 // -------- Local definitions and macros -------- //
 
@@ -128,6 +129,8 @@ static EventGroupHandle_t s_wifi_event_group;
 #define WIFI_CONNECTED_BIT      BIT0
 #define WIFI_DISCONNECTED_BIT   BIT1
 
+#define WIFI_CNX_GPIO           GPIO_NUM_16
+
 static const char *TAG = "wifi station";
 static int gWifiConnectAttempts = 0;
 
@@ -152,21 +155,6 @@ static TaskHandle_t samplingTaskHandle = NULL;                  // FIXME: If the
 static TaskHandle_t transmitTaskHandle = NULL;                  // before the adcBuffer, we get memory corruption in the BSS
                                                                 // segment. There is some kind of buffer overflow in
                                                                 // i2s_channel_read()
-
-
-////////////////////////////////////////////////////////////////////
-// get_system_time()
-//
-// Return time since epoch in microseconds. This function is mostly
-// useful for measuring durations. It doesn't return a true time
-// of day.
-////////////////////////////////////////////////////////////////////
-void get_system_time(int64_t* time_us)
-{
-    struct timeval tv_now;
-    gettimeofday(&tv_now, NULL);
-    *time_us = (int64_t)tv_now.tv_sec * 1000000L + (int64_t)tv_now.tv_usec;
-}
 
 
 ////////////////////////////////////////////////////////////////////
@@ -212,6 +200,28 @@ esp_err_t wifi_setup_driver(wifi_init_config_t* cfg)
     ESP_ERROR_CHECK(esp_wifi_init(&default_cfg));
 
     memcpy(cfg, &default_cfg, sizeof(default_cfg));
+
+    return ESP_OK;
+}
+
+
+////////////////////////////////////////////////////////////////////
+// wifi_setup_cnx_gpio()
+//
+// Configure the "Wifi connected" GPIO pin
+////////////////////////////////////////////////////////////////////
+esp_err_t wifi_setup_cnx_led()
+{
+    gpio_config_t io_conf = {
+        .pin_bit_mask = 1 << WIFI_CNX_GPIO, // Bit mask for the GPIO
+        .mode = GPIO_MODE_OUTPUT,           // Set as output mode
+        .pull_up_en = 0,                    // No pull-up
+        .pull_down_en = 0,                  // No pull-down
+        .intr_type = GPIO_INTR_DISABLE      // Disable interrupts
+    };
+
+    ESP_ERROR_CHECK(gpio_config(&io_conf));
+    ESP_ERROR_CHECK(gpio_set_level(WIFI_CNX_GPIO, 0));
 
     return ESP_OK;
 }
@@ -269,7 +279,7 @@ void _wifi_station_start(bool* error)
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA) );
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &audio_wifi_config) );
     ESP_ERROR_CHECK(esp_wifi_start() );
-
+    
     ESP_LOGI(TAG, "%s Started WiFi!\n", __func__);
     *error = false;
 }
@@ -297,6 +307,10 @@ void wifi_station_connect(bool* error, bool* connected)
     if (bits & WIFI_CONNECTED_BIT) 
     {
         ESP_LOGI(TAG, "%s: connected to Wifi!\n", __func__);
+
+        // Turn on the "Wifi connected" LED
+        gpio_set_level(WIFI_CNX_GPIO, 1);
+
         *connected = true;
         *error = false;
     } 
@@ -326,6 +340,9 @@ void wifi_station_disconnect_and_stop(bool* error)
 {
     ESP_LOGI(TAG, "%s: Disconnecting from home WiFi network\n", __func__);
     *error = true;
+
+    // Turn off the "Wifi connected" LED
+    ESP_ERROR_CHECK(gpio_set_level(WIFI_CNX_GPIO, 0));
 
     esp_err_t ret = esp_wifi_disconnect();
     if (ret == ESP_ERR_WIFI_NOT_STARTED)
@@ -624,14 +641,13 @@ esp_err_t external_adc_collect_samples(i2s_chan_handle_t* i2sHandle)
     adcBuffer.size = 0;
 
     // Keep sampling until both of the following is true 
-    //    a) the transmit task is done sending the active packet
     //    b) we've collected sufficient data to send in a packet
     size_t min_samples_required = AUDIO_PACKET_MAX_SAMPLES / 2;
     size_t min_bytes_required = min_samples_required * PCM4201_BYTES_PER_SAMPLE;
 
     uint16_t totalOverflow = 0;
 
-    while ((adcBuffer.size <= min_bytes_required) || !ulTaskNotifyTakeIndexed(transmissionDoneNotifyIndex, pdTRUE, 0))
+    while ((adcBuffer.size < ADC_BUFFER_CAPACITY) || !ulTaskNotifyTakeIndexed(transmissionDoneNotifyIndex, pdTRUE, 0))
     {
 
         // Kick the watchdog timer
@@ -690,7 +706,7 @@ esp_err_t external_adc_collect_samples(i2s_chan_handle_t* i2sHandle)
 
     if (totalOverflow > 0)
     {
-        ESP_LOGI(__func__, "Overflow of %u bytes occurred on sampling task\n", totalOverflow);
+        PRINTF_DEBUG((__func__, "Overflow of %u bytes occurred on sampling task\n", totalOverflow));
             totalOverflow = 0;
     }
 
@@ -711,17 +727,19 @@ esp_err_t external_adc_collect_samples(i2s_chan_handle_t* i2sHandle)
 
     backgroundPacket->payloadStart = 0;
 
-    // The DMA transfer in i2s_channel_read often returns instantaneously
+    // The DMA transfer in i2s_channel_read blocks for unpredictable amounts of time
     // Add a wait time corresponding to the number of samples we just took
-    // to throttle the rate at which we transmit data
-    // get_system_time(&stop);
-    // static const float denominator = 1.0f / 48000 * 1000 * 1000;
-    // uint16_t waitTimeUs = 1.0f * backgroundPacket->numSamples * denominator;
+    // to control the rate at which we transmit data. Ideally, on average, we'd
+    //  transmit data at our sampling rate
+    static const float denominator = 1.0f / 48000 * 1000 * 1000;
+    uint32_t waitTimeUs = 1.0f * backgroundPacket->numSamples * denominator;
 
-    // if (waitTimeUs > (stop - start))
-    // {
-    //     esp_rom_delay_us(waitTimeUs - (stop - start));
-    // }
+    get_system_time(&stop);
+    if (waitTimeUs > (stop - start))
+    {
+        esp_rom_delay_us(waitTimeUs - (stop - start));
+    }
+
     return ESP_OK;
 }
 
@@ -738,7 +756,7 @@ esp_err_t local_buffer_collect_samples()
     int32_t* localBuffer = audio_table_500hz;
     const size_t localBufferNumSamples = audio_table_500hz_size;
 
-    static const uint16_t numSamples = AUDIO_PACKET_MAX_SAMPLES / 2;
+    static const uint16_t numSamples = AUDIO_PACKET_MAX_SAMPLES;
     static const uint16_t waitTimeUs = 1.0f * numSamples / 48000 * 1000 * 1000;
     static uint16_t bufferIdx = 0;
 
@@ -764,8 +782,11 @@ esp_err_t local_buffer_collect_samples()
 
     esp_rom_delay_us(waitTimeUs - (stop - start));
 
-    while (!ulTaskNotifyTakeIndexed(transmissionDoneNotifyIndex, pdTRUE, 0));
-
+    while (!ulTaskNotifyTakeIndexed(transmissionDoneNotifyIndex, pdTRUE, 0))
+    {
+        esp_task_wdt_reset();
+    }
+        
     return ESP_OK;
 }
 
@@ -859,7 +880,7 @@ static void sampling_task_main(void* pvParameters)
         if (dmaBufferOverflowQueue && uxQueueMessagesWaiting(dmaBufferOverflowQueue))
         {
             // ESP_LOGE(__func__, "I2S DMA buffer overflowed!\n");
-            xQueueReset(dmaBufferOverflowQueue);
+            ESP_ERROR_CHECK_WITHOUT_ABORT(esp_task_wdt_reset());
         }
     }
 
@@ -955,22 +976,16 @@ void stream_audio_to_server(bool* error, const int sock, const struct sockaddr_i
     get_system_time(&timeOfLastEcho);
 
     // Stream audio data to server
-    int64_t prevTime, currTime, timenow;
-    get_system_time(&prevTime);
 
-    int numLoops = 0;
-    int64_t loopTime = 0;
     while (1) {
 
         // Kick the watchdog timer
         ESP_ERROR_CHECK_WITHOUT_ABORT(esp_task_wdt_reset());
 
         // Indicate to sampling thread that there is no data to transmit
-        esp_rom_delay_us(3 * 1000);
         xTaskNotifyGiveIndexed(samplingTaskHandle, transmissionDoneNotifyIndex);
 
         // Wait for the sampling task to indicate that there is new data available
-        // (Ideally, this should not block at all because we just blocked earlier)
         if(ulTaskNotifyTakeIndexed(dataReadyNotifyIndex, pdTRUE, pdMS_TO_TICKS(1000)))
         {
             PRINTF_DEBUG((TAG, "%s Got data ready notification.\n", __func__));
@@ -980,7 +995,6 @@ void stream_audio_to_server(bool* error, const int sock, const struct sockaddr_i
             ESP_LOGE(TAG, "%s Timed out waiting for data ready notification\n", __func__);
             continue;
         }
-
         // Timestamp and transmit the audio packet
     
         activePacket->echo = false; // !(activePacket->seqnum % 5000);      // request an echo from the server 
@@ -994,8 +1008,7 @@ void stream_audio_to_server(bool* error, const int sock, const struct sockaddr_i
                 __func__, activePacket->seqnum, activePacket->payloadSize, activePacket->checksum, packetSize));
 
             int err = sendto(sock, activePacket, packetSize, 0, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
-            // get_system_time(&timenow);
-            // ESP_LOGI(__func__, "Sent (%llu)\n", timenow - timesent);
+
             if (err < 0) {
                 if (errno == ENOMEM)
                 {
@@ -1197,6 +1210,7 @@ void app_main(void)
     ESP_LOGI(TAG, "%s Setting up WiFi driver", __func__);
     wifi_init_config_t cfg;
     ESP_ERROR_CHECK(wifi_setup_driver(&cfg));
+    ESP_ERROR_CHECK(wifi_setup_cnx_led());
 
     activePacket = &gAudioPackets[0];
     backgroundPacket = &gAudioPackets[1];
