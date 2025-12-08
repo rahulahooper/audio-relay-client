@@ -429,7 +429,7 @@ static bool IRAM_ATTR timer_isr_handler(gptimer_handle_t timer, const gptimer_al
 static IRAM_ATTR bool i2s_rx_queue_overflow_callback(i2s_chan_handle_t handle, i2s_event_data_t *event, void *user_ctx)
 {
     // handle RX queue overflow event ...
-    if (pdTRUE == xQueueIsQueueEmptyFromISR(dmaBufferOverflowQueue))
+    if (pdTRUE == xQueueIsQueueFullFromISR(dmaBufferOverflowQueue))
     {
         size_t dmaBufferSize;
         xQueueReceiveFromISR(dmaBufferOverflowQueue, &dmaBufferSize, NULL);
@@ -441,7 +441,7 @@ static IRAM_ATTR bool i2s_rx_queue_overflow_callback(i2s_chan_handle_t handle, i
 
 
 ////////////////////////////////////////////////////////////////////
-// setup_external_dac 
+// setup_external_adc 
 //
 // Initialize the PCM4201 analog-to-digital converter
 ////////////////////////////////////////////////////////////////////
@@ -486,8 +486,8 @@ esp_err_t setup_external_adc(i2s_chan_handle_t* i2sHandle, const uint32_t sample
        .clk_cfg = 
        {
            .sample_rate_hz = sampleRate,
-           .clk_src = I2S_CLK_SRC_DEFAULT,
-           .mclk_multiple = I2S_MCLK_MULTIPLE_256
+           .clk_src = I2S_CLK_SRC_APLL,
+           .mclk_multiple = I2S_MCLK_MULTIPLE_128,  // clock seems to be off by factor of 2?
        },
        .slot_cfg =
        {
@@ -497,7 +497,7 @@ esp_err_t setup_external_adc(i2s_chan_handle_t* i2sHandle, const uint32_t sample
             .slot_mask      = I2S_STD_SLOT_BOTH,
 
             .ws_width       = I2S_DATA_BIT_WIDTH_32BIT,
-            .ws_pol         = true,           // need to double-check this, "true" seems to mean left channel on WS high
+            .ws_pol         = true,
             .bit_shift      = false,
             .msb_right      = false
        },
@@ -632,7 +632,7 @@ esp_err_t external_adc_collect_samples(i2s_chan_handle_t* i2sHandle)
     // contents of the ADC buffer to the back buffer, removing
     // padded bytes in the process. In the future, we should
     // just sample direclty into the back buffer to save memory.
-    const size_t SAMPLES_PER_CHUNK = 10;
+    const size_t SAMPLES_PER_CHUNK = 20;
     const size_t BYTES_PER_CHUNK = SAMPLES_PER_CHUNK * PCM4201_BYTES_PER_SAMPLE; 
     const size_t ADC_BUFFER_CAPACITY = AUDIO_PACKET_MAX_SAMPLES * PCM4201_BYTES_PER_SAMPLE;
 
@@ -642,12 +642,11 @@ esp_err_t external_adc_collect_samples(i2s_chan_handle_t* i2sHandle)
 
     // Keep sampling until both of the following is true 
     //    b) we've collected sufficient data to send in a packet
-    size_t min_samples_required = AUDIO_PACKET_MAX_SAMPLES / 2;
-    size_t min_bytes_required = min_samples_required * PCM4201_BYTES_PER_SAMPLE;
+    size_t min_bytes_required = ADC_BUFFER_CAPACITY;
 
     uint16_t totalOverflow = 0;
 
-    while ((adcBuffer.size < ADC_BUFFER_CAPACITY) || !ulTaskNotifyTakeIndexed(transmissionDoneNotifyIndex, pdTRUE, 0))
+    while ((adcBuffer.size < min_bytes_required) || !ulTaskNotifyTakeIndexed(transmissionDoneNotifyIndex, pdTRUE, 0))
     {
 
         // Kick the watchdog timer
@@ -731,7 +730,7 @@ esp_err_t external_adc_collect_samples(i2s_chan_handle_t* i2sHandle)
     // Add a wait time corresponding to the number of samples we just took
     // to control the rate at which we transmit data. Ideally, on average, we'd
     //  transmit data at our sampling rate
-    static const float denominator = 1.0f / 48000 * 1000 * 1000;
+    const float denominator = 1.0f / samplingTaskConfig.sampleRate * 1000 * 1000;
     uint32_t waitTimeUs = 1.0f * backgroundPacket->numSamples * denominator;
 
     get_system_time(&stop);
@@ -876,10 +875,27 @@ static void sampling_task_main(void* pvParameters)
         backgroundPacket->numSamples = 0;
         backgroundPacket->payloadStart = 0;
 
-        // Check if the I2S DMA buffer overflowed (diagnostic)
+        // Check if the I2S DMA buffer overflowed. This can produce
+        // noticeable artifacts in the audio.
         if (dmaBufferOverflowQueue && uxQueueMessagesWaiting(dmaBufferOverflowQueue))
         {
-            // ESP_LOGE(__func__, "I2S DMA buffer overflowed!\n");
+            size_t tmp;
+            xQueueReceive(dmaBufferOverflowQueue, &tmp, 0);
+
+            static int64_t prevTime = 0;
+            static int64_t currTime = 0;
+            get_system_time(&currTime);
+
+            static uint8_t numOverflows = 0;
+            numOverflows++;
+
+            if (currTime - prevTime > 1e6)
+            {
+                ESP_LOGE(__func__, "I2S DMA buffer overflowed %u times!\n", numOverflows);
+                prevTime = currTime;
+                numOverflows = 0;
+            }
+
             ESP_ERROR_CHECK_WITHOUT_ABORT(esp_task_wdt_reset());
         }
     }
