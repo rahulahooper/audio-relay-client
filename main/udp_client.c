@@ -627,11 +627,6 @@ esp_err_t external_adc_collect_samples(i2s_chan_handle_t* i2sHandle)
     int64_t start = 0, stop = 0;
     get_system_time(&start);
 
-    // TODO: Right now, we store the chunks into an ADC buffer; when
-    // the transmit task is ready for new data, we transfer the
-    // contents of the ADC buffer to the back buffer, removing
-    // padded bytes in the process. In the future, we should
-    // just sample direclty into the back buffer to save memory.
     const size_t SAMPLES_PER_CHUNK = 20;
     const size_t BYTES_PER_CHUNK = SAMPLES_PER_CHUNK * PCM4201_BYTES_PER_SAMPLE; 
     const size_t ADC_BUFFER_CAPACITY = AUDIO_PACKET_MAX_SAMPLES * PCM4201_BYTES_PER_SAMPLE;
@@ -641,8 +636,9 @@ esp_err_t external_adc_collect_samples(i2s_chan_handle_t* i2sHandle)
     adcBuffer.size = 0;
 
     // Keep sampling until both of the following is true 
+    //    a) the transmit task is ready to receive data
     //    b) we've collected sufficient data to send in a packet
-    size_t min_bytes_required = ADC_BUFFER_CAPACITY;
+    const size_t min_bytes_required = ADC_BUFFER_CAPACITY / 2;
 
     uint16_t totalOverflow = 0;
 
@@ -658,7 +654,6 @@ esp_err_t external_adc_collect_samples(i2s_chan_handle_t* i2sHandle)
         // data in the buffer and replace it with a new chunk.
         // The chunk size is chosen to evenly divide the ADC buffer
         
-        // Overflow check: drop the oldest chunk if necessary
         if (adcBuffer.size + BYTES_PER_CHUNK > ADC_BUFFER_CAPACITY)
         {
             uint16_t overflow = adcBuffer.size + BYTES_PER_CHUNK - ADC_BUFFER_CAPACITY;
@@ -673,6 +668,7 @@ esp_err_t external_adc_collect_samples(i2s_chan_handle_t* i2sHandle)
         size_t bytesRead = 0, totalBytesRead = 0;
         esp_err_t ret = ESP_OK;
 
+        // Read data from the I2S DM
         do
         {
             uint8_t timeout_ms = 50;
@@ -680,6 +676,7 @@ esp_err_t external_adc_collect_samples(i2s_chan_handle_t* i2sHandle)
             totalBytesRead += bytesRead;
         } while (ret == ESP_OK && totalBytesRead < BYTES_PER_CHUNK);
         
+        // If errors occurred, print out what they were
         if (ret != ESP_OK || bytesRead != BYTES_PER_CHUNK)
         {
             ESP_LOGE(__func__, "Error during I2S read: (%u) %s (%u bytes read)!\n",
@@ -696,8 +693,7 @@ esp_err_t external_adc_collect_samples(i2s_chan_handle_t* i2sHandle)
         }
     }
 
-    // At this point, the transmit task is ready for data
-    //
+    // At this point, the transmit task is ready for data.
     // The data in the ADC buffer is 8-bytes per sample, with
     // 3 bytes of real data and 5 dummy bytes. When transferring
     // samples from the ADC buffer to the background packet, strip
@@ -715,7 +711,7 @@ esp_err_t external_adc_collect_samples(i2s_chan_handle_t* i2sHandle)
     {
         int sampleStart = (adcBuffer.start + i * PCM4201_BYTES_PER_SAMPLE) % ADC_BUFFER_CAPACITY;
         
-        // since adc buffer and background buffer have same sample-capacity
+        // Since adc buffer and background buffer have same sample-capacity
         // there is no risk that the background buffer will overflow
         uint wrPos = (i * AUDIO_PACKET_BYTES_PER_SAMPLE);   
 
@@ -725,19 +721,6 @@ esp_err_t external_adc_collect_samples(i2s_chan_handle_t* i2sHandle)
     }
 
     backgroundPacket->payloadStart = 0;
-
-    // The DMA transfer in i2s_channel_read blocks for unpredictable amounts of time
-    // Add a wait time corresponding to the number of samples we just took
-    // to control the rate at which we transmit data. Ideally, on average, we'd
-    //  transmit data at our sampling rate
-    const float denominator = 1.0f / samplingTaskConfig.sampleRate * 1000 * 1000;
-    uint32_t waitTimeUs = 1.0f * backgroundPacket->numSamples * denominator;
-
-    get_system_time(&stop);
-    if (waitTimeUs > (stop - start))
-    {
-        esp_rom_delay_us(waitTimeUs - (stop - start));
-    }
 
     return ESP_OK;
 }
@@ -1013,7 +996,7 @@ void stream_audio_to_server(bool* error, const int sock, const struct sockaddr_i
         }
         // Timestamp and transmit the audio packet
     
-        activePacket->echo = false; // !(activePacket->seqnum % 5000);      // request an echo from the server 
+        activePacket->echo = !(activePacket->seqnum % 5000);      // request an echo from the server 
         uint32_t packetSize = sizeof(AudioPacket_t);
 
         get_system_time(&timesent);
@@ -1057,24 +1040,24 @@ void stream_audio_to_server(bool* error, const int sock, const struct sockaddr_i
         // Optionally receive echo'd packet from server (useful to measuring Wifi speeds)
         // TODO: Make this non-blocking and wait a couple of packets before
         // timing out. This timeout can signify a network disconnection.
-        if (false)
+        if (activePacket->echo)
         {
 
-            // struct AudioPacket_t response;
-            // struct sockaddr_storage source_addr;
-            // socklen_t socklen = sizeof(source_addr);
-            // int len = recvfrom(sock, &response, sizeof(response), 0, (struct sockaddr *)&source_addr, &socklen);
+            struct AudioPacket_t response;
+            struct sockaddr_storage source_addr;
+            socklen_t socklen = sizeof(source_addr);
+            int len = recvfrom(sock, &response, sizeof(response), 0, (struct sockaddr *)&source_addr, &socklen);
 
-            // if (len < 0) 
-            // {
-            //     ESP_LOGE(TAG, "%s Failed to receive echo'd packet %u from server (errno = %s)", __func__, activePacket->seqnum, strerror(errno));
-            //     continue;
-            // }
+            if (len < 0) 
+            {
+                ESP_LOGE(TAG, "%s Failed to receive echo'd packet %u from server (errno = %s)", __func__, activePacket->seqnum, strerror(errno));
+                continue;
+            }
             
             // We successfully received an echo'd packet. Report statistics
             get_system_time(&timerecv);
-            // ESP_LOGI(TAG, "%s Received %d bytes. Seqnum = %u, payload size = %u\n", __func__, len, response.seqnum, response.numSamples);
-            // ESP_LOGI(TAG, "%s Round trip time: %lld usec\n", __func__, timerecv - timesent);
+            ESP_LOGI(TAG, "%s Received %d bytes. Seqnum = %u, payload size = %u\n", __func__, len, response.seqnum, response.numSamples);
+            ESP_LOGI(TAG, "%s Round trip time: %lld usec\n", __func__, timerecv - timesent);
 
             uint32_t avgPacketSize = bytesSinceLastEcho / packetsSinceLastEcho / AUDIO_PACKET_BYTES_PER_SAMPLE;
             float avgThroughputBytes = 1.0f * bytesSinceLastEcho / (timerecv - timeOfLastEcho) * 1000 * 1000;
