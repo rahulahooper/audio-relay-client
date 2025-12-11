@@ -1,2 +1,2 @@
-idf_component_register(SRCS "udp_client.c"
-                    INCLUDE_DIRS ".")
+idf_component_register(SRC_DIRS "src"
+                    INCLUDE_DIRS "include")

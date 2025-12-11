@@ -1,111 +1,21 @@
-| Supported Targets | ESP32 | ESP32-C2 | ESP32-C3 | ESP32-C6 | ESP32-H2 | ESP32-S2 | ESP32-S3 |
-| ----------------- | ----- | -------- | -------- | -------- | -------- | -------- | -------- |
+## Wireless Audio Transmitter
 
+This repo is one half of a wireless audio streaming system between two ESP32s.The code here specifically implements the transmitting side of the wireless system. The goal of this repo and the [receiving side](https://github.com/rahulahooper/wireless-audio-receiver/tree/main) of the wireless system is to stream audio from a guitar to an amplifier without having a physical cable between the two. 
 
-# UDP Client example
+The transmitter software consists of two parallel threads (or tasks, in FreeRTOS lingo): the sampling task and the transmit task. 
 
-(See the README.md file in the upper level 'examples' directory for more information about examples.)
+The sampling task, as its name implies, is responsible for sampling data from a guitar. It specifically interfaces with a [PCM4201](https://www.ti.com/product/PCM4201) analog-to-digital converter (DAC), which communicates over [I2S](https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/peripherals/i2s.html). The transmit task, on the other hand, is responsible for setting up the Wifi connection with and sending audio data to the receiving ESP32. The task does so using a UDP connection over Wifi. As mentioned before, the two tasks run in parallel, on separate cores. By splitting the sampling and the transmit tasks into two separate threads, we ensure that the software doesn't miss any audio data coming from the ADC.
 
-The application creates UDP socket and sends message to the predefined port and IP address. After the server's reply, the application prints received reply as ASCII text, waits for 2 seconds and sends another message.
+### Task Synchronization
 
-## How to use example
+The two tasks exchange data with one another using [double-buffering](https://wiki.osdev.org/Double_Buffering). The idea is that the sampling task places audio data into a "background packet" while the transmit task simultaneously streams an "active packet" to the receiving ESP32. These two packets are used to avoid contention between the two tasks. That is, the two tasks are always operating on separate packets, never on the same one. When the transmit task successfully sends the active packet to the receiving ESP32, it signals to the sampling task that it needs new data. The sampling task, which periodically polls for this signal, swaps the background and active packets, then signals to the transmit task that new data is available.  
 
-In order to create UDP server that communicates with UDP Client example, choose one of the following options.
+### Circuit
 
-There are many host-side tools which can be used to interact with the UDP/TCP server/client.
-One command line tool is [netcat](http://netcat.sourceforge.net) which can send and receive many kinds of packets.
-Note: please replace `192.168.0.167 3333` with desired IPV4/IPV6 address (displayed in monitor console) and port number in the following commands.
+The schematic and layout of the audio transmitter are included in the repo. The circuit is responsible for receiving audio data from a guitar, filtering it, converting it into a differential signal, then sending the differential signal to the PCM4201 ADC.
 
-Ref to the [upper level README](../README.md#host-tools) for more information.
+The circuit requires a little bit more work, as it exhibits a low overall power supply rejection. Specifically, whenever the ESP32 transmits an audio packet, there is a noticeable drop in the 5V supply rail, which powers pretty much everything on the board. As the ESP32 transmits data at a regular interval of 5ms (200Hz), this drop in the 5V rail actually introduces a noticeable 200Hz hum into the audio.
 
-### Send UDP packet via netcat
-```
-echo "Hello from PC" | nc -w1 -u 192.168.0.167 3333
-```
+I added some 1mF capacitors to the 5V rail near the ESP32. This has improved the power supply rejection of the audio circuit, but hasn't completely fixed the problem and isn't a great solution. The board is powered off of a 9V battery, which feeds into a 5V linear drop-out regulator (LDO). It's possible that selecting an LDO with a faster response to load fluctuations will fix the problem for good.
 
-### Receive UDP packet via netcat
-```
-echo "Hello from PC" | nc -w1 -u 192.168.0.167 3333
-```
-
-### UDP server using netcat
-```
-nc -u -l 192.168.0.167 3333
-```
-
-## Hardware Required
-
-This example can be run on any commonly available ESP32 development board.
-
-## Configure the project
-
-```
-idf.py menuconfig
-```
-
-Set following parameters under Example Configuration Options:
-
-* Set `IP version` of example to be IPV4 or IPV6.
-
-* Set `IPV4 Address` in case your chose IP version IPV4 above.
-
-* Set `IPV6 Address` in case your chose IP version IPV6 above.
-
-* Set `Port` number that represents remote port the example will send data and receive data from.
-
-Configure Wi-Fi or Ethernet under "Example Connection Configuration" menu. See "Establishing Wi-Fi or Ethernet Connection" section in [examples/protocols/README.md](../../README.md) for more details.
-
-
-## Build and Flash
-
-Build the project and flash it to the board, then run monitor tool to view serial output:
-
-```
-idf.py -p PORT flash monitor
-```
-
-(To exit the serial monitor, type ``Ctrl-]``.)
-
-See the Getting Started Guide for full steps to configure and use ESP-IDF to build projects.
-
-
-## Troubleshooting
-
-Start server first, to receive data sent from the client (application).
-
-## Running the example for Linux target
-
-This example could be executed on host system, using lwIP port for linux and FreeRTOS simulator on linux. The socket API used in this example directly calls lwIP implementation. Follow the steps below to configure, build and run the example on linux operating system.
-
-1. First configure the target (please note that using linux target is currently available only in `preview` stage)
-```
-idf.py --preview set-target linux
-```
-2. Configure the project
-```
-idf.py menuconfig
-```
-Choose connection capabilities in `Example Connection Configuration` menu:
-
-* By default, the `example_connect()` function returns as a no-op, expecting that the connection is already available. This option is preferred when we don't have to interact with outside networking layers and use only lwIP internal interface, such as loopback netif (`lo`).
-* If you want to connect lwIP network interface to the host system networking, set `EXAMPLE_CONNECT_LWIP_TAPIF`.
-    * Configure the interface address information (IP address, GW address and netmask).
-    * Create a host network interface named `tap0` of *TAP* type. You can use the `./make_tap_netif` script located in the `tapif_io` component directory.
-    * Optionally set input or output packet loss rate to simulate loosing data of physical interfaces.
-    * Note about the host side networking:
-    * This example uses static IP address configured in `tapif_io` component configuration.
-    * Use the IP ranges that do not overlap with any other IP range of the host system.
-    * Make sure that the same IP range is configured in `tap0` interface created by tge `./make_tap_netif` script.
-    * You can leave the defaults in the script and `tapif_io` settings unless any other host network interface uses `192.168.5.x` range.
-    * Read more about host-side networking in the [`tapif_io` component documentation](../../../common_components/protocol_examples_tapif_io/README.md).
-
-3. Generate partition table for the application:
-```
-idf.by partition-table
-```
-
-4. Build and run the example the usual way (Note that the flash step is left out)
-```
-idf.by build
-idf.py monitor
-```
+The circuit also consumes power like crazy, making it impractical to power the board off of 9V for extended periods of time. I haven't made any direct measurements but I suspect that the WiFi is consuming the most power. While there are some optimizations to make in the softare to make the WiFi less power hungry, a low-hanging fruit in the hardware is the LDO. The LDO converts the battery's 9V supply rail to 5V, which itself gets regulated down to 3.3V by the ESP32. This means that 9V - 3.3V = 5.7V provided by the battery are dissipated as heat. 

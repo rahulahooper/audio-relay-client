@@ -1,11 +1,13 @@
 #ifndef EXAMPLE_AUDIO_FILE_H
 #define EXAMPLE_AUDIO_FILE_H
 
+#include <stdint.h>
+
 // All the samples below were generated as 24-bit signed integers that were then sign-extended
 // to 32-bits. These integers can be converted back to their 24-bit representation with no loss
 // of information by removing the MSB, which is composed solely of sign bits. 
 
-int32_t audio_table_1khz[] = {
+static const int32_t audio_table_1khz[] = {
     0x0, 0x10b515, 0x2120fb, 0x30fbc5, 0x3fffff, 0x4debe4, 0x5a8279, 0x658c99, 0x6ed9eb, 0x7641ae, 0x7ba374, 
     0x7ee7a9, 0x7fffff, 0x7ee7a9, 0x7ba374, 0x7641ae, 0x6ed9eb, 0x658c99, 0x5a8279, 0x4debe4, 0x3fffff, 
     0x30fbc5, 0x2120fb, 0x10b515, 0x0, 0xffef4aeb, 0xffdedf05, 0xffcf043b, 0xffc00001, 0xffb2141c, 0xffa57d87, 
@@ -13,9 +15,9 @@ int32_t audio_table_1khz[] = {
     0xff9a7367, 0xffa57d87, 0xffb2141c, 0xffc00000, 0xffcf043b, 0xffdedf05, 0xffef4aeb
 };
 
-size_t audio_table_1khz_size = sizeof(audio_table_1khz) / sizeof(audio_table_1khz[0]);
+static const size_t audio_table_1khz_size = sizeof(audio_table_1khz) / sizeof(audio_table_1khz[0]);
 
-int32_t audio_table_500hz[] = {
+static const int32_t audio_table_500hz[] = {
     0x0, 0x85f21, 0x10b515, 0x18f8b8, 0x2120fb, 0x2924ed, 0x30fbc5, 0x389cea, 0x3fffff, 0x471cec, 0x4debe4, 
     0x546571, 0x5a8279, 0x603c49, 0x658c99, 0x6a6d98, 0x6ed9eb, 0x72ccb9, 0x7641ae, 0x793501, 0x7ba374, 
     0x7d8a5e, 0x7ee7a9, 0x7fb9d6, 0x7fffff, 0x7fb9d6, 0x7ee7a9, 0x7d8a5e, 0x7ba374, 0x793501, 0x7641ae, 
@@ -28,9 +30,9 @@ int32_t audio_table_500hz[] = {
     0xffd6db13, 0xffdedf05, 0xffe70748, 0xffef4aeb, 0xfff7a0df
 };
 
-const unsigned int audio_table_500hz_size = sizeof(audio_table_500hz) / sizeof(audio_table_500hz[0]);
+static const unsigned int audio_table_500hz_size = sizeof(audio_table_500hz) / sizeof(audio_table_500hz[0]);
 
-int32_t audio_table_250hz[] = {
+static const int32_t audio_table_250hz[] = {
 0x0, 0x43024, 0x85f21, 0xc8bd3, 0x10b515, 0x14d9c2, 0x18f8b8, 0x1d10d6, 0x2120fb, 0x25280c, 0x2924ed, 
 0x2d1687, 0x30fbc5, 0x34d395, 0x389cea, 0x3c56ba, 0x3fffff, 0x4397ba, 0x471cec, 0x4a8ea0, 0x4debe4, 
 0x5133cc, 0x546571, 0x577ff3, 0x5a8279, 0x5d6c2f, 0x603c49, 0x62f201, 0x658c99, 0x680b5b, 0x6a6d98, 
@@ -53,11 +55,11 @@ int32_t audio_table_250hz[] = {
 0xfffbcfdc
 };
 
-const unsigned int audio_table_250hz_size = sizeof(audio_table_250hz) / sizeof(audio_table_250hz[0]);
+static const unsigned int audio_table_250hz_size = sizeof(audio_table_250hz) / sizeof(audio_table_250hz[0]);
 
-const int32_t audio_table_const[] = {
+static const int32_t audio_table_const[] = {
     0xdeadbeef, 0xdedebaba, 0xbeaddeaf, 0xbaddadaf
 };
 
-const unsigned int audio_table_const_size = sizeof(audio_table_const) / sizeof(audio_table_const[0]);
+static const unsigned int audio_table_const_size = sizeof(audio_table_const) / sizeof(audio_table_const[0]);
 #endif // EXAMPLE_AUDIO_FILE_H

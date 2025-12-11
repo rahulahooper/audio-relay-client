@@ -6,20 +6,6 @@
 #include "esp_log.h"
 
 
-////////////////////////////////////////////////////////////////////
-// get_system_time()
-//
-// Return time since epoch in microseconds. This function is mostly
-// useful for measuring durations. It doesn't return a true time
-// of day.
-////////////////////////////////////////////////////////////////////
-void get_system_time(int64_t* time_us)
-{
-    struct timeval tv_now;
-    gettimeofday(&tv_now, NULL);
-    *time_us = (int64_t)tv_now.tv_sec * 1000000L + (int64_t)tv_now.tv_usec;
-}
-
 
 ////////////////////////////////////////////////////////////////////
 // TrafficMeter 
