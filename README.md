@@ -19,7 +19,7 @@ The two tasks exchange data with one another using [double-buffering](https://wi
 ### Circuit
 
 <figure style="text-align:center">
-  <img src="pcb.jpg" alt="System Diagram">
+  <img src="pcb.jpg" alt="System Diagram" width=500>
   <figcaption>The circuit board, with some debug wires soldered</figcaption>
 </figure>
 <br><br>
