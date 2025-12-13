@@ -30,4 +30,10 @@ The circuit requires a little bit more work, as it exhibits a low overall power 
 
 I added some 1mF capacitors to the 5V rail near the ESP32. This has improved the power supply rejection of the audio circuit, but hasn't completely fixed the problem and isn't a great solution. The board is powered off of a 9V battery, which feeds into a 5V linear drop-out regulator (LDO). It's possible that selecting an LDO with a faster response to load fluctuations will fix the problem for good.
 
-The circuit also consumes power like crazy, making it impractical to power the board off of 9V for extended periods of time. I haven't made any direct measurements but I suspect that the WiFi is consuming the most power. While there are some optimizations to make in the softare to make the WiFi less power hungry, a low-hanging fruit in the hardware is the LDO. The LDO converts the battery's 9V supply rail to 5V, which itself gets regulated down to 3.3V by the ESP32. This means that 9V - 3.3V = 5.7V provided by the battery are dissipated as heat. 
+The circuit also consumes power like crazy, making it impractical to power the board off of 9V for extended periods of time. I haven't made any direct measurements but I suspect that the WiFi is consuming the most power. While there are some optimizations to make in the softare to make the WiFi less power hungry, a low-hanging fruit in the hardware is the LDO. The LDO converts the battery's 9V supply rail to 5V, which itself gets regulated down to 3.3V by the ESP32. This means that 9V - 3.3V = 5.7V provided by the battery are dissipated as heat.
+
+### Building the project
+
+1. Install the [ESP-IDF](https://docs.espressif.com/projects/esp-idf/en/stable/esp32/get-started/index.html)
+2. Compile the code:  `$ idf.py build`
+3. Flash the code onto the board: `$idf.py flash`
