@@ -16,6 +16,21 @@ The sampling task, as its name implies, is responsible for sampling data from a 
 
 The two tasks exchange data with one another using [double-buffering](https://wiki.osdev.org/Double_Buffering). The idea is that the sampling task places audio data into a "background packet" while the transmit task simultaneously streams an "active packet" to the receiving ESP32. These two packets are used to avoid contention between the two tasks. That is, the two tasks are always operating on separate packets, never on the same one. When the transmit task successfully sends the active packet to the receiving ESP32, it signals to the sampling task that it needs new data. The sampling task, which periodically polls for this signal, swaps the background and active packets, then signals to the transmit task that new data is available.  
 
+### Theoretical Latency
+To compute the theoretical latency of this wireless system, we need to consider:
+
+  1) The amount of time a sample is cached in the transmitting ESP32 before it is sent to the Wifi driver. Samples are cached while the sampling task assembles an audio packet.
+      - A sample is cached for _size_of_audio_packet_ / _sampling_rate_ = 300 / 48000 = 6.25ms
+  2)  The time it takes for the ESP32s to communicate the data
+      - By having the receiving ESP32 periodically echo packets back to the transmitter, we can compute the round-trip time of the wireless communication. 
+      - This has been computed to be roughly 3ms --> 1.5ms for one-way communication
+  3) The amount of time a sample is cached in the [receiving ESP32](https://github.com/rahulahooper/wireless-audio-receiver/blob/main/README.md) before it is sent to the amplifier
+      - The receive task on the receiving ESP32 caches data for some time before sending it to the amplifier. This means that when a sample arrives at the receiving ESP32, there is already about a packet's worth of data in the cache waiting to be sent to the playback task.
+      - The approximate amount of time the audio spends in the cache is _size_of_audio_packet_ / _sampling_rate_ = 300 / 48000 = 6.25ms. 
+
+**The theoretical total latency of the audio system, then, is roughly 14ms.** While it should be possible to further reduce the latency by reducing the audio packet size, I personally did not notice the 14ms.
+
+
 ### Circuit
 
 <figure style="text-align:center">
